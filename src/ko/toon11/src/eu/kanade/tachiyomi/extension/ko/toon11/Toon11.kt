@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
+import okhttp3.Interceptor
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
@@ -8,6 +9,8 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import java.io.IOException
+import kotlin.random.Random
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -32,7 +35,9 @@ class Toon11 : ParsedHttpSource() {
 
     override val supportsLatest = true
 
-    override val client: OkHttpClient = network.cloudflareClient
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(RetryAndRateLimitInterceptor())
+        .build()
 
     override fun popularMangaSelector() = "li[data-id]"
 
@@ -202,6 +207,50 @@ class Toon11 : ParsedHttpSource() {
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
 
+    private class RetryAndRateLimitInterceptor(
+        private val minIntervalMs: Long = 750L,
+        private val maxRetries: Int = 3,
+        private val baseBackoffMs: Long = 1000L
+    ) : Interceptor {
+        companion object {
+            private val lock = Any()
+            @Volatile private var lastCallAt: Long = 0L
+        }
+
+        override fun intercept(chain: Interceptor.Chain): Response {
+            synchronized(lock) {
+                val now = System.currentTimeMillis()
+                val remain = minIntervalMs - (now - lastCallAt)
+                if (remain > 0) {
+                    try {
+                        Thread.sleep(remain)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                lastCallAt = System.currentTimeMillis()
+            }
+
+            var attempt = 0
+            var lastException: IOException? = null
+            var response: Response? = null
+
+            while (attempt <= maxRetries) {
+                try {
+                    response?.close()
+                    response = chain.proceed(chain.request())
+                    if (response.code != 503 && response.code != 429) return response
+                    response.close()
+                } catch (e: IOException) { lastException = e }
+
+                val backoff = baseBackoffMs * (1L shl attempt) + Random.nextLong(0, 250)
+                try { Thread.sleep(backoff) } catch (_: InterruptedException) {}
+                attempt++
+            }
+            response?.let { return it }
+            throw lastException ?: IOException("Request failed after retries")
+        }
+    }
+    
     // Filters
 
     override fun getFilterList() = FilterList(
