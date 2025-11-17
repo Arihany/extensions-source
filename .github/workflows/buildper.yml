@@ -1,0 +1,106 @@
+name: Build Toon11 Extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_self_hosted:
+        type: boolean
+        default: false
+        description: "true = self-hosted, false = GitHub runner"
+      module_path:
+        type: string
+        default: ":src:ko:toon11"
+        description: "Gradle project path (e.g. :src:ko:toon11)"
+      build_type:
+        type: choice
+        default: Release
+        options: [Debug, Release]
+        description: "Build variant"
+      create_release:
+        type: boolean
+        default: false
+        description: "Upload APKs to a GitHub Release tag"
+      release_tag:
+        type: string
+        default: "toon11"
+        description: "Release tag name (used when create_release=true)"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -Eeuo pipefail {0}
+
+jobs:
+  build:
+    name: Build ${{ inputs.module_path }} (${{ inputs.build_type }})
+    runs-on: ${{ fromJSON( (format('{0}', inputs.use_self_hosted) == 'true' && '["self-hosted"]') || '["ubuntu-latest"]' ) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Ensure Gradle wrapper is executable
+        run: |
+          if [[ -f gradlew ]]; then chmod +x gradlew; fi
+
+      - name: Build APK
+        uses: gradle/gradle-build-action@v3
+        with:
+          arguments: ${{ format('{0}:assemble{1}', inputs.module_path, inputs.build_type) }}
+          gradle-home-cache-cleanup: true
+
+      - name: Collect APKs
+        id: apk
+        run: |
+          BT_LOWER=$(echo "${{ inputs.build_type }}" | tr '[:upper:]' '[:lower:]')
+          mapfile -t FILES < <(find . -type f -path "./**/outputs/apk/**/${BT_LOWER}/*.apk" | sort)
+          if (( ${#FILES[@]} == 0 )); then
+            echo "No APKs found." >&2
+            exit 1
+          fi
+          printf 'files<<EOF\n' >> "$GITHUB_OUTPUT"
+          for f in "${FILES[@]}"; do echo "$f"; done >> "$GITHUB_OUTPUT"
+          printf 'EOF\n' >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toon11-${{ inputs.build_type }}-apks
+          path: ${{ steps.apk.outputs.files }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create or update GitHub Release (optional)
+        if: inputs.create_release == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          BODY=$'11toon extension build\nBuild type: ${{ inputs.build_type }}\nRun: ${{ github.run_id }}'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$BODY"
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$BODY"
+          fi
+          while read -r f; do
+            NAME=$(basename "$f")
+            # skip if same asset already exists
+            if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$NAME"; then
+              echo "Skip existing asset: $NAME"
+            else
+              gh release upload "$TAG" "$f" --clobber
+            fi
+          done <<< "${{ steps.apk.outputs.files }}"
