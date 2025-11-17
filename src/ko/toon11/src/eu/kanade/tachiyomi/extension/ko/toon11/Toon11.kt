@@ -215,7 +215,7 @@ class Toon11 : ParsedHttpSource() {
         companion object {
             private val lock = Any()
 
-            @Volatile 
+            @Volatile
             private var lastCallAt: Long = 0L
         }
 
@@ -252,7 +252,7 @@ class Toon11 : ParsedHttpSource() {
             throw lastException ?: IOException("Request failed after retries")
         }
     }
-    
+
     // Filters
 
     override fun getFilterList() = FilterList(
