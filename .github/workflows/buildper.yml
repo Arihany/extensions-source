@@ -56,11 +56,8 @@ jobs:
         run: |
           if [[ -f gradlew ]]; then chmod +x gradlew; fi
 
-      - name: Build APK
-        uses: gradle/gradle-build-action@v3
-        with:
-          arguments: ${{ format('{0}:assemble{1}', inputs.module_path, inputs.build_type) }}
-          gradle-home-cache-cleanup: true
+      - name: Build Toon11
+        run: ./gradlew assembleRelease
 
       - name: Collect APKs
         id: apk
