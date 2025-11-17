@@ -1,7 +1,6 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
-import okhttp3.Interceptor
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
@@ -9,21 +8,22 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import java.io.IOException
-import kotlin.random.Random
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.ArrayList
 import java.util.Date
 import java.util.Locale
+import kotlin.random.Random
 
 class Toon11 : ParsedHttpSource() {
 
@@ -210,11 +210,13 @@ class Toon11 : ParsedHttpSource() {
     private class RetryAndRateLimitInterceptor(
         private val minIntervalMs: Long = 750L,
         private val maxRetries: Int = 3,
-        private val baseBackoffMs: Long = 1000L
+        private val baseBackoffMs: Long = 1000L,
     ) : Interceptor {
         companion object {
             private val lock = Any()
-            @Volatile private var lastCallAt: Long = 0L
+
+            @Volatile 
+            private var lastCallAt: Long = 0L
         }
 
         override fun intercept(chain: Interceptor.Chain): Response {
