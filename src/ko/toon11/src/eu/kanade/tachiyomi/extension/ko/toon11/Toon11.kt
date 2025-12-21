@@ -269,7 +269,6 @@ class Toon11 : ParsedHttpSource() {
         }
         
         override fun intercept(chain: Interceptor.Chain): Response {
-
             var attempt = 0
             var lastException: IOException? = null
             var lastErrorResponse: Response? = null
