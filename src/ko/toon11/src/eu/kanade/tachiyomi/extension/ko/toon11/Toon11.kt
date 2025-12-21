@@ -219,36 +219,85 @@ class Toon11 : ParsedHttpSource() {
             private var lastCallAt: Long = 0L
         }
 
-        override fun intercept(chain: Interceptor.Chain): Response {
+        private val httpDateFormat = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("GMT")
+        }
+
+        private fun throttleGlobal(minIntervalMs: Long) {
             synchronized(lock) {
                 val now = System.currentTimeMillis()
                 val remain = minIntervalMs - (now - lastCallAt)
                 if (remain > 0) {
-                    try {
-                        Thread.sleep(remain)
-                    } catch (_: InterruptedException) {
-                    }
+                    try { Thread.sleep(remain) } catch (_: InterruptedException) {}
                 }
                 lastCallAt = System.currentTimeMillis()
             }
+        }
+
+        private fun isRetryableMethod(request: Request): Boolean {
+            return request.method == "GET" || request.method == "HEAD"
+        }
+
+        private fun isTransientServerCode(code: Int): Boolean {
+            return code == 429 || code == 503 || code == 502 || code == 504 || code == 408 ||
+                code == 520 || code == 521 || code == 522 || code == 524
+        }
+
+        private fun parseRetryAfterMs(response: Response, maxRetryAfterMs: Long = 60_000L): Long? {
+            val v = response.header("Retry-After")?.trim().orEmpty()
+            if (v.isEmpty()) return null
+
+            v.toLongOrNull()?.let { seconds ->
+                val ms = seconds * 1000L
+                return ms.coerceIn(0L, maxRetryAfterMs)
+            }
+
+            return try {
+                val whenMs = httpDateFormat.parse(v)?.time ?: return null
+                val now = System.currentTimeMillis()
+                val ms = (whenMs - now).coerceAtLeast(0L)
+                ms.coerceAtMost(maxRetryAfterMs)
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        private fun computeBackoffMs(attempt: Int, baseBackoffMs: Long, maxBackoffMs: Long = 15_000L): Long {
+            val exp = baseBackoffMs * (1L shl attempt).coerceAtMost(1L shl 10)
+            val jitter = Random.nextLong(0, 250)
+            return (exp + jitter).coerceAtMost(maxBackoffMs)
+        }
+        
+        override fun intercept(chain: Interceptor.Chain): Response {
 
             var attempt = 0
             var lastException: IOException? = null
-            var response: Response? = null
+            var lastErrorResponse: Response? = null
+            val request = chain.request()
+
+            if (!isRetryableMethod(request)) {
+                return chain.proceed(request)
+            }
 
             while (attempt <= maxRetries) {
                 try {
-                    response?.close()
-                    response = chain.proceed(chain.request())
-                    if (response.code != 503 && response.code != 429) return response
-                    response.close()
+                    throttleGlobal(minIntervalMs)
+
+                    lastErrorResponse?.close()
+                    val r = chain.proceed(request)
+
+                    if (!isTransientServerCode(r.code)) return r
+                    lastErrorResponse = r
                 } catch (e: IOException) { lastException = e }
 
-                val backoff = baseBackoffMs * (1L shl attempt) + Random.nextLong(0, 250)
-                try { Thread.sleep(backoff) } catch (_: InterruptedException) {}
+                if (attempt == maxRetries) break
+
+                val retryAfter = lastErrorResponse?.let { parseRetryAfterMs(it) }
+                val waitMs = retryAfter ?: computeBackoffMs(attempt, baseBackoffMs)
+                try { Thread.sleep(waitMs) } catch (_: InterruptedException) {}
                 attempt++
             }
-            response?.let { return it }
+            lastErrorResponse?.let { return it }
             throw lastException ?: IOException("Request failed after retries")
         }
     }
@@ -312,5 +361,8 @@ class Toon11 : ParsedHttpSource() {
         SelectFilterOption("라노벨", "라노벨"),
         SelectFilterOption("애니화", "애니화"),
         SelectFilterOption("TL", "TL"),
+        SelectFilterOption("공포", "공포"),
+        SelectFilterOption("하렘", "하렘"),
+        SelectFilterOption("요리", "요리"),
     )
 }
