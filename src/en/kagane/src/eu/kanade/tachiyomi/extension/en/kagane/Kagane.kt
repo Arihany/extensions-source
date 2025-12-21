@@ -12,13 +12,18 @@ import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebView
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import eu.kanade.tachiyomi.extension.en.kagane.ChapterDto.Companion.dateFormat
+import eu.kanade.tachiyomi.extension.en.kagane.wv.Cdm
+import eu.kanade.tachiyomi.extension.en.kagane.wv.ProtectionSystemHeaderBox
+import eu.kanade.tachiyomi.extension.en.kagane.wv.parsePssh
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.await
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -30,6 +35,7 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
+import keiyoushi.utils.tryParse
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.buildJsonObject
@@ -72,7 +78,6 @@ class Kagane : HttpSource(), ConfigurableSource {
     override val client = network.cloudflareClient.newBuilder()
         .addInterceptor(ImageInterceptor())
         .addInterceptor(::refreshTokenInterceptor)
-        .rateLimit(2)
         // fix disk cache
         .apply {
             val index = networkInterceptors().indexOfFirst { it is BrotliInterceptor }
@@ -95,7 +100,8 @@ class Kagane : HttpSource(), ConfigurableSource {
                 .url(url.newBuilder().setQueryParameter("token", accessToken).build())
                 .build(),
         )
-        if (response.code == 401) {
+
+        if (response.code == 401 || response.code == 507) {
             response.close()
             val challenge = try {
                 getChallengeResponse(seriesId, chapterId)
@@ -125,7 +131,7 @@ class Kagane : HttpSource(), ConfigurableSource {
                 ContentRatingFilter(
                     preferences.contentRating.toSet(),
                 ),
-                ScanlationsFilter(),
+                GenresFilter(emptyList()),
             ),
         )
 
@@ -138,11 +144,11 @@ class Kagane : HttpSource(), ConfigurableSource {
             page,
             "",
             FilterList(
-                SortFilter(Filter.Sort.Selection(2, false)),
+                SortFilter(Filter.Sort.Selection(6, false)),
                 ContentRatingFilter(
                     preferences.contentRating.toSet(),
                 ),
-                ScanlationsFilter(),
+                GenresFilter(emptyList()),
             ),
         )
 
@@ -154,6 +160,9 @@ class Kagane : HttpSource(), ConfigurableSource {
         val body = buildJsonObject {
             filters.forEach { filter ->
                 when (filter) {
+                    is GenresFilter -> {
+                        filter.addToJsonObject(this, preferences.excludedGenres.toList())
+                    }
                     is JsonFilter -> {
                         filter.addToJsonObject(this)
                     }
@@ -175,15 +184,17 @@ class Kagane : HttpSource(), ConfigurableSource {
                     is SortFilter -> {
                         filter.toUriPart().takeIf { it.isNotEmpty() }
                             ?.let { uriPart -> addQueryParameter("sort", uriPart) }
-                    }
-
-                    is ScanlationsFilter -> {
-                        addQueryParameter("scanlations", filter.state.toString())
+                            ?: run {
+                                if (query.isBlank()) {
+                                    addQueryParameter("sort", "updated_at,desc")
+                                }
+                            }
                     }
 
                     else -> {}
                 }
             }
+            addQueryParameter("scanlations", preferences.showScanlations.toString())
         }
 
         return POST(url.toString(), headers, body)
@@ -191,7 +202,30 @@ class Kagane : HttpSource(), ConfigurableSource {
 
     override fun searchMangaParse(response: Response): MangasPage {
         val dto = response.parseAs<SearchDto>()
-        val mangas = dto.content.map { it.toSManga(apiUrl) }
+        val mangas = dto.content.filter {
+            if (!preferences.showDuplicates) {
+                val alternateSeries = client.newCall(GET("$apiUrl/api/v1/alternate_series/${it.id}", apiHeaders))
+                    .execute()
+                    .parseAs<List<AlternateSeries>>()
+
+                if (alternateSeries.isEmpty()) return@filter true
+
+                val date = dateFormat.tryParse(it.releaseDate)
+                for (alt in alternateSeries) {
+                    val altDate = dateFormat.tryParse(alt.releaseDate)
+
+                    when {
+                        it.booksCount < alt.booksCount -> return@filter false
+                        it.booksCount == alt.booksCount -> {
+                            if (date > altDate) return@filter false
+                        }
+                    }
+                }
+                true
+            } else {
+                true
+            }
+        }.map { it.toSManga(apiUrl, preferences.showSource) }
         return MangasPage(mangas, hasNextPage = dto.hasNextPage())
     }
 
@@ -203,7 +237,11 @@ class Kagane : HttpSource(), ConfigurableSource {
     }
 
     override fun mangaDetailsRequest(manga: SManga): Request {
-        return GET("$apiUrl/api/v1/series/${manga.url}", apiHeaders)
+        return mangaDetailsRequest(manga.url)
+    }
+
+    private fun mangaDetailsRequest(seriesId: String): Request {
+        return GET("$apiUrl/api/v1/series/$seriesId", apiHeaders)
     }
 
     override fun getMangaUrl(manga: SManga): String {
@@ -213,8 +251,25 @@ class Kagane : HttpSource(), ConfigurableSource {
     // ============================== Chapters ==============================
 
     override fun chapterListParse(response: Response): List<SChapter> {
+        val seriesId = response.request.url.toString()
+            .substringAfterLast("/")
+
         val dto = response.parseAs<ChapterDto>()
-        return dto.content.map { it -> it.toSChapter() }.reversed()
+
+        val source = runCatching {
+            client.newCall(mangaDetailsRequest(seriesId))
+                .execute()
+                .parseAs<DetailsDto>()
+                .source
+        }.getOrDefault("")
+        val useSourceChapterNumber = source in setOf(
+            "Dark Horse Comics",
+            "Flame Comics",
+            "MangaDex",
+            "Square Enix Manga",
+        )
+
+        return dto.content.map { it -> it.toSChapter(useSourceChapterNumber) }.reversed()
     }
 
     override fun chapterListRequest(manga: SManga): Request {
@@ -228,11 +283,15 @@ class Kagane : HttpSource(), ConfigurableSource {
         add("Referer", "$baseUrl/")
     }.build()
 
-    private fun getCertificate(): String {
-        return client.newCall(GET("$apiUrl/api/v1/static/bin.bin", apiHeaders)).execute()
+    private fun getCertificate(url: String): String {
+        return client.newCall(GET(url, apiHeaders)).execute()
             .body.bytes()
             .toBase64()
     }
+
+    private val windvineCertificate by lazy { getCertificate("$apiUrl/api/v1/static/bin.bin") }
+
+    private val fairPlayCertificate by lazy { getCertificate("$apiUrl/api/v1/static/crt.crt") }
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
         if (chapter.url.count { it == ';' } != 2) throw Exception("Chapter url error, please refresh chapter list.")
@@ -250,8 +309,9 @@ class Kagane : HttpSource(), ConfigurableSource {
                 addPathSegment(seriesId)
                 addPathSegment("file")
                 addPathSegment(chapterId)
-                addPathSegment((page + 1).toString())
+                addPathSegment(challengeResp.pageMapping.getValue(page + 1))
                 addQueryParameter("token", accessToken)
+                addQueryParameter("index", (page + 1).toString())
             }.build().toString()
 
             Page(page, imageUrl = pageUrl)
@@ -260,13 +320,41 @@ class Kagane : HttpSource(), ConfigurableSource {
         return Observable.just(pages)
     }
 
-    private var cacheUrl = "https://kazana.$domain"
+    private var cacheUrl = "https://yukine.$domain"
     private var accessToken: String = ""
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun getChallengeResponse(seriesId: String, chapterId: String): ChallengeDto {
         val f = "$seriesId:$chapterId".sha256().sliceArray(0 until 16)
 
+        val challenge = if (preferences.wvd.isNotBlank()) {
+            getChallengeWvd(f)
+        } else {
+            getChallengeWebview(f, chapterId)
+        }
+
+        val challengeUrl =
+            "$apiUrl/api/v1/books/$seriesId/file/$chapterId".toHttpUrl().newBuilder().apply {
+                if (preferences.dataSaver) {
+                    addQueryParameter("datasaver", true.toString())
+                }
+            }.build()
+        val challengeBody = buildJsonObject {
+            put("challenge", challenge)
+        }.toJsonString().toRequestBody("application/json".toMediaType())
+
+        return client.newCall(POST(challengeUrl.toString(), apiHeaders, challengeBody)).execute()
+            .parseAs<ChallengeDto>()
+    }
+
+    private fun getChallengeWvd(f: ByteArray): String {
+        val cdm = Cdm.fromData(preferences.wvd)
+        val pssh = parsePssh(getPssh(f)).content as? ProtectionSystemHeaderBox
+            ?: throw Exception("Failed to parse pssh")
+        return cdm.getLicenseChallenge(pssh)
+    }
+
+    private fun getChallengeWebview(f: ByteArray, chapterId: String): String {
         val interfaceName = "jsInterface"
         val html = """
             <!DOCTYPE html>
@@ -277,6 +365,10 @@ class Kagane : HttpSource(), ConfigurableSource {
             </head>
             <body>
                 <script>
+                    function detectDRMSupport() {
+                        return "WebKitMediaKeys" in window ? "fairplay" : "MediaKeys" in window && "function" == typeof navigator.requestMediaKeySystemAccess ? "widevine" : null
+                    }
+
                     function base64ToArrayBuffer(base64) {
                         var binaryString = atob(base64);
                         var bytes = new Uint8Array(binaryString.length);
@@ -287,21 +379,39 @@ class Kagane : HttpSource(), ConfigurableSource {
                     }
 
                     async function getData() {
-                        const g = base64ToArrayBuffer("${getCertificate()}");
-                        let t = await navigator.requestMediaKeySystemAccess("com.widevine.alpha", [{
-                          initDataTypes: ["cenc"],
-                          audioCapabilities: [],
-                          videoCapabilities: [{
-                            contentType: 'video/mp4; codecs="avc1.42E01E"'
-                          }]
+                        let widevine = detectDRMSupport() !== 'fairplay';
+                        const g = base64ToArrayBuffer(widevine ? "$windvineCertificate" : "$fairPlayCertificate");
+                        let t = widevine ? await navigator.requestMediaKeySystemAccess("com.widevine.alpha", [{
+                            initDataTypes: ["cenc"],
+                            audioCapabilities: [],
+                            videoCapabilities: [{
+                                contentType: 'video/mp4; codecs="avc1.42E01E"'
+                            }]
+                        }]) : await navigator.requestMediaKeySystemAccess("com.apple.fps", [{
+                            initDataTypes: ["skd"],
+                            audioCapabilities: [{
+                                contentType: 'audio/mp4; codecs="mp4a.40.2"'
+                            }],
+                            videoCapabilities: [{
+                                contentType: 'video/mp4; codecs="avc1.42E01E"'
+                            }]
                         }]);
 
                         let e = await t.createMediaKeys();
                         await e.setServerCertificate(g);
+                        let video = widevine ? null : document.createElement("video");
+                        if (video) {
+                            video.style.display = "none";
+                            document.body.appendChild(video);
+                            await video.setMediaKeys(e);
+                        }
                         let n = e.createSession();
                         let i = new Promise((resolve, reject) => {
                           function onMessage(event) {
                             n.removeEventListener("message", onMessage);
+                            if (video) {
+                                document.body.removeChild(video)
+                            }
                             resolve(event.message);
                           }
 
@@ -314,7 +424,18 @@ class Kagane : HttpSource(), ConfigurableSource {
                           n.addEventListener("error", onError);
                         });
 
-                        await n.generateRequest("cenc", base64ToArrayBuffer("${getPssh(f).toBase64()}"));
+                        if (widevine) {
+                            await n.generateRequest("cenc", base64ToArrayBuffer("${getPssh(f).toBase64()}"));
+                        } else {
+                            let oo = base64ToArrayBuffer("${f.toBase64()}")
+                            let c = Array.from(new Uint8Array(oo)).map(t => t.toString(16).padStart(2, "0")).join("");
+                            let d = JSON.stringify({
+                                uri: "skd://" + c,
+                                assetId: "$chapterId",
+                            });
+                            const textEncoder = new TextEncoder();
+                            await n.generateRequest("skd", textEncoder.encode(d));
+                        }
                         let o = await i;
                         let m = new Uint8Array(o);
                         let v = btoa(String.fromCharCode(...m));
@@ -366,18 +487,7 @@ class Kagane : HttpSource(), ConfigurableSource {
             throw Exception("Failed to get drm challenge")
         }
 
-        val challengeUrl =
-            "$apiUrl/api/v1/books/$seriesId/file/$chapterId".toHttpUrl().newBuilder().apply {
-                if (preferences.dataSaver) {
-                    addQueryParameter("datasaver", true.toString())
-                }
-            }.build()
-        val challengeBody = buildJsonObject {
-            put("challenge", jsInterface.challenge)
-        }.toJsonString().toRequestBody("application/json".toMediaType())
-
-        return client.newCall(POST(challengeUrl.toString(), apiHeaders, challengeBody)).execute()
-            .parseAs<ChallengeDto>()
+        return jsInterface.challenge
     }
 
     private fun concat(vararg arrays: ByteArray): ByteArray =
@@ -430,8 +540,23 @@ class Kagane : HttpSource(), ConfigurableSource {
             return CONTENT_RATINGS.slice(0..index.coerceAtLeast(0))
         }
 
+    private val SharedPreferences.excludedGenres: Set<String>
+        get() = this.getStringSet(GENRES_PREF, emptySet()) ?: emptySet()
+
+    private val SharedPreferences.showScanlations: Boolean
+        get() = this.getBoolean(SHOW_SCANLATIONS, SHOW_SCANLATIONS_DEFAULT)
+
+    private val SharedPreferences.showSource: Boolean
+        get() = this.getBoolean(SHOW_SOURCE, SHOW_SOURCE_DEFAULT)
+
+    private val SharedPreferences.showDuplicates: Boolean
+        get() = this.getBoolean(SHOW_DUPLICATES, SHOW_DUPLICATES_DEFAULT)
+
     private val SharedPreferences.dataSaver
         get() = this.getBoolean(DATA_SAVER, false)
+
+    private val SharedPreferences.wvd
+        get() = this.getString(WVD_KEY, WVD_DEFAULT)!!
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
@@ -443,10 +568,52 @@ class Kagane : HttpSource(), ConfigurableSource {
             setDefaultValue(CONTENT_RATING_DEFAULT)
         }.let(screen::addPreference)
 
+        MultiSelectListPreference(screen.context).apply {
+            key = GENRES_PREF
+            title = "Exclude Genres"
+            entries = GenresList.map { it.replaceFirstChar { c -> c.uppercase() } }.toTypedArray()
+            entryValues = GenresList
+            summary = preferences.excludedGenres.joinToString { it.replaceFirstChar { c -> c.uppercase() } }
+            setDefaultValue(emptySet<String>())
+
+            setOnPreferenceChangeListener { _, values ->
+                val selected = values as Set<String>
+                this.summary = selected.joinToString { it.replaceFirstChar { c -> c.uppercase() } }
+                true
+            }
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = SHOW_SCANLATIONS
+            title = "Show scanlations"
+            setDefaultValue(SHOW_SCANLATIONS_DEFAULT)
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = SHOW_DUPLICATES
+            title = "Show duplicates"
+            summary = "Show duplicate entries.\nPicks the entry with most chapters if disabled\nThis switch isn't always accurate\nNOTE: Enabling this option will slow your search speed down"
+            setDefaultValue(SHOW_DUPLICATES_DEFAULT)
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = SHOW_SOURCE
+            title = "Show source name"
+            summary = "Show source name in title"
+            setDefaultValue(SHOW_SOURCE_DEFAULT)
+        }.let(screen::addPreference)
+
         SwitchPreferenceCompat(screen.context).apply {
             key = DATA_SAVER
             title = "Data saver"
             setDefaultValue(false)
+        }.let(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = WVD_KEY
+            title = "WVD file"
+            summary = "Enter contents as base64 string"
+            setDefaultValue(WVD_DEFAULT)
         }.let(screen::addPreference)
     }
 
@@ -462,7 +629,20 @@ class Kagane : HttpSource(), ConfigurableSource {
             "pornographic",
         )
 
+        private const val GENRES_PREF = "pref_genres_exclude"
+        private const val SHOW_SCANLATIONS = "pref_show_scanlations"
+        private const val SHOW_SCANLATIONS_DEFAULT = true
+
+        private const val SHOW_SOURCE = "pref_show_source"
+        private const val SHOW_SOURCE_DEFAULT = false
+
+        private const val SHOW_DUPLICATES = "pref_show_duplicates"
+        private const val SHOW_DUPLICATES_DEFAULT = true
+
         private const val DATA_SAVER = "data_saver_default"
+
+        private const val WVD_KEY = "wvd_key"
+        private const val WVD_DEFAULT = ""
     }
 
     // ============================= Filters ==============================
@@ -486,17 +666,16 @@ class Kagane : HttpSource(), ConfigurableSource {
             // TagsFilter(),
             // SourcesFilter(),
             Filter.Separator(),
-            ScanlationsFilter(),
         )
 
         val response = metadataClient.newCall(
-            GET("$apiUrl/api/v1/metadata", headers, CacheControl.FORCE_CACHE),
+            GET("$apiUrl/api/v1/metadata", apiHeaders, CacheControl.FORCE_CACHE),
         ).await()
 
         // the cache only request fails if it was not cached already
         if (!response.isSuccessful) {
             metadataClient.newCall(
-                GET("$apiUrl/api/v1/metadata", headers, CacheControl.FORCE_NETWORK),
+                GET("$apiUrl/api/v1/metadata", apiHeaders, CacheControl.FORCE_NETWORK),
             ).enqueue(
                 object : Callback {
                     override fun onResponse(call: Call, response: Response) {
@@ -511,7 +690,7 @@ class Kagane : HttpSource(), ConfigurableSource {
             filters.addAll(
                 index = 0,
                 listOf(
-                    Filter.Header("Press 'reset' to load more filters"),
+                    Filter.Header("Press 'Reset' to load more filters"),
                     Filter.Separator(),
                 ),
             )
@@ -539,7 +718,7 @@ class Kagane : HttpSource(), ConfigurableSource {
             listOf(
                 GenresFilter(metadata.getGenresList()),
                 TagsFilter(metadata.getTagsList()),
-                SourcesFilter(metadata.getSourcesList()),
+                SourcesFilter(metadata.getSourcesList().filter { !(!preferences.showScanlations && !officialSources.contains(it.name.lowercase())) }),
             ),
         )
 
