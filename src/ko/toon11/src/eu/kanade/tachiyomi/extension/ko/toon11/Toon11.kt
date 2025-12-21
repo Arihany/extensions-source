@@ -267,7 +267,7 @@ class Toon11 : ParsedHttpSource() {
             val jitter = Random.nextLong(0, 250)
             return (exp + jitter).coerceAtMost(maxBackoffMs)
         }
-        
+
         override fun intercept(chain: Interceptor.Chain): Response {
             var attempt = 0
             var lastException: IOException? = null
