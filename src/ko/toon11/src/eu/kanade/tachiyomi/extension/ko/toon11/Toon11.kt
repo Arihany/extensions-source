@@ -51,17 +51,17 @@ class Toon11 : ParsedHttpSource() {
         .set("Origin", baseUrl)
         .set(
             "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         )
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        // host당 동시요청 제한(429 의심 대비)
+    .override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .dispatcher(
             Dispatcher().apply {
                 maxRequests = 16
                 maxRequestsPerHost = 4
-            }
+            },
         )
+
         // 이미지 핫링크/UA 민감한 서버 대응
         .addInterceptor(FixupHeadersInterceptor(baseUrl, browserUA))
         .addInterceptor(RetryAndRateLimitInterceptor())
