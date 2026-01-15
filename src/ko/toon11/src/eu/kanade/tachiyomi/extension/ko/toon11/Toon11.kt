@@ -47,16 +47,19 @@ class Toon11 : ParsedHttpSource() {
     private val fallbackThumbHost = "https://11toon8.com"
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-            .set("Referer", "$baseUrl/")
-            .set("Origin", baseUrl)
-            .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+        .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
+        .set(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        )
 
-    .override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-            .dispatcher(limiterDispatcher)
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .dispatcher(limiterDispatcher)
+        .addInterceptor(FixupHeadersInterceptor(baseUrl))
+        .addInterceptor(RetryAndRateLimitInterceptor())
+        .build()
 
-            .addInterceptor(FixupHeadersInterceptor(baseUrl))
-            .addInterceptor(RetryAndRateLimitInterceptor())
-            .build()
     // ---------- Requests ----------
     // 사용자 제공 RAW에 맞춤
     private val latestBase =
