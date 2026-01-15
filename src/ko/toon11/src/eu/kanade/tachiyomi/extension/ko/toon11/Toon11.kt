@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
+import okhttp3.Dispatcher
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
@@ -37,36 +38,25 @@ class Toon11 : ParsedHttpSource() {
     override val lang = "ko"
     override val supportsLatest = true
 
-    private val browserUA =
-        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    // host당 동시요청 제한(429 의심 대비)
+    private val limiterDispatcher = Dispatcher().apply {
+        maxRequests = 16
+        maxRequestsPerHost = 4
+    }
 
-    // 이미지 호스트는 종종 바뀜(11toon8, 11toon9 ...)이라서
-    // style/data-mobile-image에서 호스트를 뽑는 걸 1순위로 두고,
-    // 실패 시 data-id 기반으로 fallback.
     private val fallbackThumbHost = "https://11toon8.com"
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .set("User-Agent", browserUA)
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
-        .set(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        )
+            .set("Referer", "$baseUrl/")
+            .set("Origin", baseUrl)
+            .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 
     .override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .dispatcher(
-            Dispatcher().apply {
-                maxRequests = 16
-                maxRequestsPerHost = 4
-            },
-        )
+            .dispatcher(limiterDispatcher)
 
-        // 이미지 핫링크/UA 민감한 서버 대응
-        .addInterceptor(FixupHeadersInterceptor(baseUrl, browserUA))
-        .addInterceptor(RetryAndRateLimitInterceptor())
-        .build()
-
+            .addInterceptor(FixupHeadersInterceptor(baseUrl))
+            .addInterceptor(RetryAndRateLimitInterceptor())
+            .build()
     // ---------- Requests ----------
     // 사용자 제공 RAW에 맞춤
     private val latestBase =
@@ -305,7 +295,6 @@ class Toon11 : ParsedHttpSource() {
     // ---------- Interceptors ----------
     private class FixupHeadersInterceptor(
         private val baseUrl: String,
-        private val userAgent: String,
     ) : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val req = chain.request()
@@ -317,7 +306,6 @@ class Toon11 : ParsedHttpSource() {
                 url.encodedPath.endsWith(".jpeg", true)
 
             val b = req.newBuilder()
-                .header("User-Agent", userAgent)
 
             // 이미지쪽은 Referer/Accept 민감한 경우가 많아서 강제
             if (isImage) {
