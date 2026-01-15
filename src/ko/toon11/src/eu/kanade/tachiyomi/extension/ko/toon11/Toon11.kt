@@ -43,14 +43,17 @@ class Toon11 : ParsedHttpSource() {
 
     override fun latestUpdatesSelector() = popularMangaSelector()
 
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
+    override fun popularMangaRequest(page: Int) =
+        GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
 
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&sord=&type=upd&page=$page", headers)
+    override fun latestUpdatesRequest(page: Int) =
+        GET("$baseUrl/bbs/board.php?bo_table=toon_c&sord=&type=upd&page=$page", headers)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         return if (query.isNotBlank()) {
             val url = "$baseUrl/bbs/search_stx.php".toHttpUrl().newBuilder().apply {
                 addQueryParameter("stx", query)
+                if (page > 1) addQueryParameter("page", page.toString())
             }.build()
             GET(url, headers)
         } else {
@@ -77,18 +80,51 @@ class Toon11 : ParsedHttpSource() {
         }
     }
 
+    // -------- Thumbnail parsing (unified) --------
+
+    private val cssUrlRegex = Regex("""url\((['"]?)(.*?)\1\)""", RegexOption.IGNORE_CASE)
+
+    private fun normalizeImgUrl(raw: String): String? {
+        val u = raw.trim()
+        if (u.isBlank()) return null
+        return when {
+            u.startsWith("http://") || u.startsWith("https://") -> u
+            u.startsWith("//") -> "https:$u"
+            u.startsWith("/") -> baseUrl + u
+            else -> "https:$u" // host-only or scheme-less oddities
+        }
+    }
+
+    private fun extractThumbUrl(container: Element): String? {
+        val thumb = container.selectFirst(".homelist-thumb") ?: return null
+
+        // 1) data-* 우선
+        thumb.attr("data-mobile-image").takeIf { it.isNotBlank() }?.let {
+            // absUrl이 빈 문자열이면 raw를 정규화
+            return thumb.absUrl("data-mobile-image").ifBlank { normalizeImgUrl(it) }
+        }
+
+        // 2) img src가 있는 케이스
+        thumb.selectFirst("img")?.absUrl("src")?.takeIf { it.isNotBlank() }?.let { return it }
+
+        // 3) style background-image: url(...)
+        val style = thumb.attr("style").orEmpty()
+        val raw = cssUrlRegex.find(style)?.groupValues?.getOrNull(2)
+        return raw?.let { normalizeImgUrl(it) }
+    }
+
+    // -------- Parsers --------
+
     override fun popularMangaFromElement(element: Element) = SManga.create().apply {
         setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
         title = element.selectFirst(".homelist-title")!!.text()
-        thumbnail_url = element.selectFirst(".homelist-thumb")?.absUrl("data-mobile-image")
+        thumbnail_url = extractThumbUrl(element)
     }
 
     override fun latestUpdatesFromElement(element: Element) = SManga.create().apply {
         setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
         title = element.selectFirst(".homelist-title")!!.text()
-        element.selectFirst(".homelist-thumb")?.also {
-            thumbnail_url = "https:" + it.attr("style").substringAfter("url('").substringBefore("')")
-        }
+        thumbnail_url = extractThumbUrl(element)
     }
 
     override fun popularMangaNextPageSelector() = ".pg_end"
@@ -100,10 +136,16 @@ class Toon11 : ParsedHttpSource() {
     override fun searchMangaFromElement(element: Element) = SManga.create().apply {
         title = element.selectFirst(".homelist-title")!!.text()
         val dataId = element.attr("data-id")
-        setUrlWithoutDomain("$baseUrl/bbs/board.php?bo_table=toons&stx=$title&is=$dataId")
-        element.selectFirst(".homelist-thumb")?.also {
-            thumbnail_url = "https:" + it.attr("style").substringAfter("url('").substringBefore("')")
-        }
+
+        // 기존: 문자열 합치기(한글/공백/특수문자 깨질 수 있음) -> HttpUrl로 안전하게 인코딩
+        val detailsUrl = "$baseUrl/bbs/board.php".toHttpUrl().newBuilder()
+            .addQueryParameter("bo_table", "toons")
+            .addQueryParameter("stx", title)
+            .addQueryParameter("is", dataId)
+            .build()
+
+        setUrlWithoutDomain(detailsUrl.toString())
+        thumbnail_url = extractThumbUrl(element)
     }
 
     override fun searchMangaNextPageSelector() = popularMangaNextPageSelector()
@@ -150,7 +192,6 @@ class Toon11 : ParsedHttpSource() {
         val pg2url = nav.selectFirst(".pg_current ~ .pg_page")!!.absUrl("href")
 
         // recursively build the chapter list
-
         parseChapters(pg2url, chapters)
 
         return chapters
@@ -313,7 +354,11 @@ class Toon11 : ParsedHttpSource() {
 
     class SelectFilterOption(val name: String, val value: String)
 
-    abstract class SelectFilter(name: String, private val options: List<SelectFilterOption>, default: Int = 0) : Filter.Select<String>(name, options.map { it.name }.toTypedArray(), default) {
+    abstract class SelectFilter(
+        name: String,
+        private val options: List<SelectFilterOption>,
+        default: Int = 0,
+    ) : Filter.Select<String>(name, options.map { it.name }.toTypedArray(), default) {
         val selected: String
             get() = options[state].value
     }
