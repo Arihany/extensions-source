@@ -10,6 +10,8 @@ import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Dispatcher
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
@@ -29,25 +31,62 @@ class Toon11 : ParsedHttpSource() {
 
     override val name = "11toon"
 
-    override val baseUrl = "https://www.11toon.com"
+    // www 제거: Referer/Origin/리다이렉트 꼬임 방지용
+    override val baseUrl = "https://11toon.com"
 
     override val lang = "ko"
-
     override val supportsLatest = true
 
+    private val browserUA =
+        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
+    // 이미지 호스트는 종종 바뀜(11toon8, 11toon9 ...)이라서
+    // style/data-mobile-image에서 호스트를 뽑는 걸 1순위로 두고,
+    // 실패 시 data-id 기반으로 fallback.
+    private val fallbackThumbHost = "https://11toon8.com"
+
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+        .set("User-Agent", browserUA)
+        .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
+        .set(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+        )
+
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        // host당 동시요청 제한(429 의심 대비)
+        .dispatcher(
+            Dispatcher().apply {
+                maxRequests = 16
+                maxRequestsPerHost = 4
+            }
+        )
+        // 이미지 핫링크/UA 민감한 서버 대응
+        .addInterceptor(FixupHeadersInterceptor(baseUrl, browserUA))
         .addInterceptor(RetryAndRateLimitInterceptor())
         .build()
 
-    override fun popularMangaSelector() = "li[data-id]"
+    // ---------- Requests ----------
+    // 사용자 제공 RAW에 맞춤
+    private val latestBase =
+        "$baseUrl/bbs/board.php?bo_table=toon_c&type=upd&tablename=%EC%B5%9C%EC%8B%A0%EB%A7%8C%ED%99%94"
+    private val popularBase =
+        "$baseUrl/bbs/board.php?bo_table=toon_c&tablename=%EC%9D%B8%EA%B8%B0%EB%A7%8C%ED%99%94"
 
-    override fun latestUpdatesSelector() = popularMangaSelector()
+    override fun popularMangaRequest(page: Int): Request {
+        val url = popularBase.toHttpUrl().newBuilder().apply {
+            if (page > 1) addQueryParameter("page", page.toString())
+        }.build()
+        return GET(url, headers)
+    }
 
-    override fun popularMangaRequest(page: Int) =
-        GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
-
-    override fun latestUpdatesRequest(page: Int) =
-        GET("$baseUrl/bbs/board.php?bo_table=toon_c&sord=&type=upd&page=$page", headers)
+    override fun latestUpdatesRequest(page: Int): Request {
+        val url = latestBase.toHttpUrl().newBuilder().apply {
+            if (page > 1) addQueryParameter("page", page.toString())
+        }.build()
+        return GET(url, headers)
+    }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         return if (query.isNotBlank()) {
@@ -80,7 +119,25 @@ class Toon11 : ParsedHttpSource() {
         }
     }
 
-    // -------- Thumbnail parsing (unified) --------
+    // ---------- Selectors ----------
+    override fun popularMangaSelector() = "li[data-id]"
+    override fun latestUpdatesSelector() = popularMangaSelector()
+    override fun searchMangaSelector() = popularMangaSelector()
+
+    override fun popularMangaNextPageSelector() = ".pg_end"
+    override fun latestUpdatesNextPageSelector() = popularMangaNextPageSelector()
+    override fun searchMangaNextPageSelector() = popularMangaNextPageSelector()
+
+    // ---------- URL / Thumbnail helpers ----------
+    private fun buildDetailsUrl(title: String, dataId: String): String {
+        // javascript:; 무시하고 data-id 기반으로 안정적인 상세 URL 생성
+        return "$baseUrl/bbs/board.php".toHttpUrl().newBuilder()
+            .addQueryParameter("bo_table", "toons")
+            .addQueryParameter("stx", title)
+            .addQueryParameter("is", dataId)
+            .build()
+            .toString()
+    }
 
     private val cssUrlRegex = Regex("""url\((['"]?)(.*?)\1\)""", RegexOption.IGNORE_CASE)
 
@@ -91,65 +148,65 @@ class Toon11 : ParsedHttpSource() {
             u.startsWith("http://") || u.startsWith("https://") -> u
             u.startsWith("//") -> "https:$u"
             u.startsWith("/") -> baseUrl + u
-            else -> "https:$u" // host-only or scheme-less oddities
+            else -> u
         }
     }
 
-    private fun extractThumbUrl(container: Element): String? {
-        val thumb = container.selectFirst(".homelist-thumb") ?: return null
-
-        // 1) data-* 우선
-        thumb.attr("data-mobile-image").takeIf { it.isNotBlank() }?.let {
-            // absUrl이 빈 문자열이면 raw를 정규화
-            return thumb.absUrl("data-mobile-image").ifBlank { normalizeImgUrl(it) }
-        }
-
-        // 2) img src가 있는 케이스
-        thumb.selectFirst("img")?.absUrl("src")?.takeIf { it.isNotBlank() }?.let { return it }
-
-        // 3) style background-image: url(...)
-        val style = thumb.attr("style").orEmpty()
-        val raw = cssUrlRegex.find(style)?.groupValues?.getOrNull(2)
-        return raw?.let { normalizeImgUrl(it) }
+    private fun inferThumbFromId(dataId: String, host: String = fallbackThumbHost): String? {
+        val id = dataId.trim()
+        if (id.isEmpty()) return null
+        // 서버가 숫자 id.webp 패턴이라서 그냥 직행
+        return "$host/data/toon_category/$id.webp"
     }
 
-    // -------- Parsers --------
+    private fun extractThumbUrl(item: Element): String? {
+        val dataId = item.attr("data-id").trim()
+        val thumb = item.selectFirst(".homelist-thumb")
 
+        // 1) data-mobile-image가 있으면 그걸로(호스트도 여기서 자동으로 따라감)
+        thumb?.attr("data-mobile-image")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return normalizeImgUrl(it) }
+
+        // 2) style에서 url(...) 파싱
+        thumb?.attr("style")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { style ->
+                val raw = cssUrlRegex.find(style)?.groupValues?.getOrNull(2)
+                val normalized = raw?.let { normalizeImgUrl(it) }
+                if (!normalized.isNullOrBlank()) return normalized
+            }
+
+        // 3) 마지막 fallback: data-id 기반
+        return inferThumbFromId(dataId)
+    }
+
+    // ---------- Manga parsing ----------
     override fun popularMangaFromElement(element: Element) = SManga.create().apply {
-        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
-        title = element.selectFirst(".homelist-title")!!.text()
+        val titleText = element.selectFirst(".homelist-title")?.text().orEmpty()
+        val dataId = element.attr("data-id").trim()
+        title = titleText
+        setUrlWithoutDomain(buildDetailsUrl(titleText, dataId))
         thumbnail_url = extractThumbUrl(element)
     }
 
     override fun latestUpdatesFromElement(element: Element) = SManga.create().apply {
-        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
-        title = element.selectFirst(".homelist-title")!!.text()
+        val titleText = element.selectFirst(".homelist-title")?.text().orEmpty()
+        val dataId = element.attr("data-id").trim()
+        title = titleText
+        setUrlWithoutDomain(buildDetailsUrl(titleText, dataId))
         thumbnail_url = extractThumbUrl(element)
     }
-
-    override fun popularMangaNextPageSelector() = ".pg_end"
-
-    override fun latestUpdatesNextPageSelector() = popularMangaNextPageSelector()
-
-    override fun searchMangaSelector() = popularMangaSelector()
 
     override fun searchMangaFromElement(element: Element) = SManga.create().apply {
-        title = element.selectFirst(".homelist-title")!!.text()
-        val dataId = element.attr("data-id")
-
-        // 기존: 문자열 합치기(한글/공백/특수문자 깨질 수 있음) -> HttpUrl로 안전하게 인코딩
-        val detailsUrl = "$baseUrl/bbs/board.php".toHttpUrl().newBuilder()
-            .addQueryParameter("bo_table", "toons")
-            .addQueryParameter("stx", title)
-            .addQueryParameter("is", dataId)
-            .build()
-
-        setUrlWithoutDomain(detailsUrl.toString())
+        val titleText = element.selectFirst(".homelist-title")?.text().orEmpty()
+        val dataId = element.attr("data-id").trim()
+        title = titleText
+        setUrlWithoutDomain(buildDetailsUrl(titleText, dataId))
         thumbnail_url = extractThumbUrl(element)
     }
 
-    override fun searchMangaNextPageSelector() = popularMangaNextPageSelector()
-
+    // ---------- Details ----------
     override fun mangaDetailsParse(document: Document): SManga {
         return SManga.create().apply {
             title = document.selectFirst("h2.title")!!.text()
@@ -167,6 +224,7 @@ class Toon11 : ParsedHttpSource() {
         else -> SManga.UNKNOWN
     }
 
+    // ---------- Chapters ----------
     private tailrec fun parseChapters(nextURL: String, chapters: ArrayList<SChapter>) {
         val newpage = fetchPagesFromNav(nextURL)
         newpage.select(chapterListSelector()).forEach {
@@ -185,15 +243,10 @@ class Toon11 : ParsedHttpSource() {
             chapters.add(chapterFromElement(it))
         }
 
-        if (nav == null) {
-            return chapters
-        }
+        if (nav == null) return chapters
 
         val pg2url = nav.selectFirst(".pg_current ~ .pg_page")!!.absUrl("href")
-
-        // recursively build the chapter list
         parseChapters(pg2url, chapters)
-
         return chapters
     }
 
@@ -219,12 +272,13 @@ class Toon11 : ParsedHttpSource() {
     private fun dateParse(dateAsString: String): Long {
         val date: Date? = try {
             dateFormat.parse(dateAsString)
-        } catch (e: ParseException) {
+        } catch (_: ParseException) {
             null
         }
         return date?.time ?: 0L
     }
 
+    // ---------- Pages ----------
     override fun pageListRequest(chapter: SChapter): Request {
         return GET(baseUrl + "/bbs" + chapter.url, headers)
     }
@@ -243,10 +297,38 @@ class Toon11 : ParsedHttpSource() {
     private fun extractList(jsString: String): List<String> {
         val matchResult = imgListRegex.find(jsString)
         val listString = matchResult?.groupValues?.get(1) ?: return emptyList()
-        return Json.decodeFromString<List<String>>(listString)
+        return Json.decodeFromString(listString)
     }
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
+
+    // ---------- Interceptors ----------
+    private class FixupHeadersInterceptor(
+        private val baseUrl: String,
+        private val userAgent: String,
+    ) : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val req = chain.request()
+            val url = req.url
+
+            val isImage = url.encodedPath.endsWith(".webp", true) ||
+                url.encodedPath.endsWith(".png", true) ||
+                url.encodedPath.endsWith(".jpg", true) ||
+                url.encodedPath.endsWith(".jpeg", true)
+
+            val b = req.newBuilder()
+                .header("User-Agent", userAgent)
+
+            // 이미지쪽은 Referer/Accept 민감한 경우가 많아서 강제
+            if (isImage) {
+                b.header("Referer", "$baseUrl/")
+                b.header("Origin", baseUrl)
+                b.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+            }
+
+            return chain.proceed(b.build())
+        }
+    }
 
     private class RetryAndRateLimitInterceptor(
         private val minIntervalMs: Long = 750L,
@@ -304,7 +386,7 @@ class Toon11 : ParsedHttpSource() {
         }
 
         private fun computeBackoffMs(attempt: Int, baseBackoffMs: Long, maxBackoffMs: Long = 15_000L): Long {
-            val exp = baseBackoffMs * (1L shl attempt).coerceAtMost(1L shl 10)
+            val exp = baseBackoffMs * (1L shl attempt).coerceAtMost(1 shl 10).toLong()
             val jitter = Random.nextLong(0, 250)
             return (exp + jitter).coerceAtMost(maxBackoffMs)
         }
@@ -315,9 +397,7 @@ class Toon11 : ParsedHttpSource() {
             var lastErrorResponse: Response? = null
             val request = chain.request()
 
-            if (!isRetryableMethod(request)) {
-                return chain.proceed(request)
-            }
+            if (!isRetryableMethod(request)) return chain.proceed(request)
 
             while (attempt <= maxRetries) {
                 try {
@@ -325,10 +405,11 @@ class Toon11 : ParsedHttpSource() {
 
                     lastErrorResponse?.close()
                     val r = chain.proceed(request)
-
                     if (!isTransientServerCode(r.code)) return r
                     lastErrorResponse = r
-                } catch (e: IOException) { lastException = e }
+                } catch (e: IOException) {
+                    lastException = e
+                }
 
                 if (attempt == maxRetries) break
 
@@ -337,13 +418,13 @@ class Toon11 : ParsedHttpSource() {
                 try { Thread.sleep(waitMs) } catch (_: InterruptedException) {}
                 attempt++
             }
+
             lastErrorResponse?.let { return it }
             throw lastException ?: IOException("Request failed after retries")
         }
     }
 
-    // Filters
-
+    // ---------- Filters ----------
     override fun getFilterList() = FilterList(
         Filter.Header("Note: can't combine search query with filters, status filter only has effect in 인기만화"),
         Filter.Separator(),
@@ -368,8 +449,8 @@ class Toon11 : ParsedHttpSource() {
     class GenreFilter(options: List<SelectFilterOption>, default: Int) : SelectFilter("Genre", options, default)
 
     private val getSortList = listOf(
-        SelectFilterOption("인기만화", "$baseUrl/bbs/board.php?bo_table=toon_c"),
-        SelectFilterOption("최신만화", "$baseUrl/bbs/board.php?bo_table=toon_c&tablename=최신만화&type=upd"),
+        SelectFilterOption("인기만화", popularBase),
+        SelectFilterOption("최신만화", latestBase),
     )
 
     private val getStatusList = listOf(
