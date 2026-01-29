@@ -283,8 +283,6 @@ class Toon11 : ParsedHttpSource() {
         return chapters
     }
 
-    private fun fetchPagesFromNav(url: String) = throw UnsupportedOperationException("Not used")
-
     override fun chapterListSelector() = "ul.mEpisodeList > li"
 
     override fun chapterFromElement(element: Element): SChapter {
