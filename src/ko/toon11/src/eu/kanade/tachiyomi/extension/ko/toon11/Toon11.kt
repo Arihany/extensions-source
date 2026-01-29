@@ -317,7 +317,7 @@ class Toon11 : ParsedHttpSource() {
         SelectFilterOption("요리", "요리"),
     )
     private companion object {
-        private const val RATE_LIMIT_REQUESTS = 1
-        private const val RATE_LIMIT_PERIOD_SECONDS = 3L
+        private const val RATE_LIMIT_REQUESTS = 2
+        private const val RATE_LIMIT_PERIOD_SECONDS = 1L
     }
 }
