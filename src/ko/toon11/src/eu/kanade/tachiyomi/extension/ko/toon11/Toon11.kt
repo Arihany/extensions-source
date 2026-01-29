@@ -288,26 +288,45 @@ class Toon11 : ParsedHttpSource() {
     }
 
     private fun canonicalizeChapterUrl(raw: String): String? {
-        var u = raw.trim()
-        if (u.isEmpty()) return null
+        var s = raw.trim()
+        if (s.isEmpty()) return null
 
-        if (u.startsWith("./")) u = u.removePrefix("./")
+        // onclick 안에 &가 &amp; 로 남는 케이스 방어
+        s = s.replace("&amp;", "&")
+        if (s.startsWith("//")) s = "https:$s"
+        if (s.startsWith("./")) s = s.removePrefix("./")
 
-        if (u.startsWith("http://") || u.startsWith("https://")) {
-            u = try {
-                val http = u.toHttpUrl()
-                val q = http.encodedQuery?.let { "?$it" }.orEmpty()
-                http.encodedPath + q
-            } catch (_: IllegalArgumentException) {
-                return null
-            }
+        val resolved = try {
+            baseUrl.toHttpUrl().resolve(s) ?: return null
+        } catch (_: IllegalArgumentException) {
+            return null
         }
 
-        if (u.startsWith("/bbs/")) u = u.removePrefix("/bbs/")
-        if (u.startsWith("bbs/")) u = u.removePrefix("bbs/")
+        val boTable = resolved.queryParameter("bo_table")
+        val wrId = resolved.queryParameter("wr_id")
 
-        if (!u.startsWith("/")) u = "/$u"
-        return u
+        // wr_id가 있으면: "같은 화"를 무조건 같은 문자열로 고정 (순서/잡파라미터 제거)
+        if (!boTable.isNullOrBlank() && !wrId.isNullOrBlank()) {
+            val canon = resolved.newBuilder()
+                .encodedPath("/bbs/board.php")
+                .query(null)
+                .addQueryParameter("bo_table", boTable)
+                .addQueryParameter("wr_id", wrId)
+                .build()
+            val q = canon.encodedQuery?.let { "?$it" }.orEmpty()
+            return canon.encodedPath.removePrefix("/bbs") + q
+        }
+
+        // fallback: 쿼리 파라미터 정렬로 최소한 "순서 차이"는 제거
+        val b = resolved.newBuilder().query(null)
+        resolved.queryParameterNames.toList().sorted().forEach { name ->
+            resolved.queryParameterValues(name).forEach { value ->
+                b.addQueryParameter(name, value)
+            }
+        }
+        val canon = b.build()
+        val q = canon.encodedQuery?.let { "?$it" }.orEmpty()
+        return canon.encodedPath.removePrefix("/bbs") + q
     }
 
     override fun chapterFromElement(element: Element): SChapter {
@@ -316,7 +335,15 @@ class Toon11 : ParsedHttpSource() {
 
         val onclick = urlEl.attr("onclick").orEmpty()
         val href = extractOnclickHref(onclick).orEmpty()
-        val canon = canonicalizeChapterUrl(href).orEmpty()
+        val canon = canonicalizeChapterUrl(href) ?: run {
+            // 정규화 실패 시에도 url 비워버리면 더 큰 사고남. 기존 방식으로라도 저장.
+            var u = href.trim().replace("&amp;", "&")
+            if (u.startsWith("./")) u = u.removePrefix("./")
+            if (u.startsWith("/bbs/")) u = u.removePrefix("/bbs/")
+            if (u.startsWith("bbs/")) u = u.removePrefix("bbs/")
+            if (!u.startsWith("/")) u = "/$u"
+            u
+        }
 
         return SChapter.create().apply {
             setUrlWithoutDomain(canon)
