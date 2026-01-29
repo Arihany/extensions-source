@@ -53,10 +53,6 @@ class Toon11 : ParsedHttpSource() {
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         )
 
-    /**
-     * ✅ 이미지 다운로드용(무제한) = Tachiyomi가 이미지 요청에 사용하는 기본 client
-     * ✅ HTML 요청용(rate limit) = 아래 fetch*에서만 사용
-     */
     private val baseClient: OkHttpClient = network.cloudflareClient.newBuilder()
         .dispatcher(limiterDispatcher)
         .addInterceptor(FixupHeadersInterceptor(baseUrl))
@@ -278,7 +274,6 @@ class Toon11 : ParsedHttpSource() {
         return chapters
     }
 
-    // ✅ HTML 네비게이션 페이지도 rateLimitedClient로
     private fun fetchPagesFromNav(url: String) =
         rateLimitedClient.newCall(GET(url, headers)).execute().asJsoup()
 
@@ -387,9 +382,9 @@ class Toon11 : ParsedHttpSource() {
     }
 
     private companion object {
-        // NewToki 스타일 rateLimit(permits, periodSeconds) 하드코딩
+        // RateLimit
         private const val RATE_LIMIT_PERMITS = 1
-        private const val RATE_LIMIT_PERIOD_SECONDS = 2L
+        private const val RATE_LIMIT_PERIOD_SECONDS = 1L
 
         private fun isImageRequest(request: Request): Boolean {
             val p = request.url.encodedPath.lowercase(Locale.US)
