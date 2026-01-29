@@ -30,7 +30,7 @@ class Toon11 : ParsedHttpSource() {
 
     override val name = "11toon"
 
-    override val baseUrl = "https://www.11toon.com"
+    override val baseUrl = "https://update.spotv24.com"
 
     override val lang = "ko"
 
