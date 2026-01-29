@@ -13,11 +13,13 @@ import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
@@ -51,9 +53,11 @@ class Toon11 : ParsedHttpSource() {
 
     override fun latestUpdatesSelector() = popularMangaSelector()
 
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
+    override fun popularMangaRequest(page: Int) =
+        GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
 
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&sord=&type=upd&page=$page", headers)
+    override fun latestUpdatesRequest(page: Int) =
+        GET("$baseUrl/bbs/board.php?bo_table=toon_c&sord=&type=upd&page=$page", headers)
 
     override fun fetchPopularManga(page: Int): Observable<MangasPage> {
         return rateLimitedClient.newCall(popularMangaRequest(page))
@@ -89,9 +93,10 @@ class Toon11 : ParsedHttpSource() {
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         return if (query.isNotBlank()) {
-            val url = "$baseUrl/bbs/search_stx.php".toHttpUrl().newBuilder().apply {
-                addQueryParameter("stx", query)
-            }.build()
+            val url = "$baseUrl/bbs/search_stx.php".toHttpUrl()
+                .newBuilder()
+                .addQueryParameter("stx", query)
+                .build()
             GET(url, headers)
         } else {
             var urlString = ""
@@ -167,7 +172,7 @@ class Toon11 : ParsedHttpSource() {
 
     // ==========
     // Chapter list: NO pagination.
-    // Detail page -> "처음부터" viewer -> modal(#sList) full episode list
+    // Detail page -> "처음부터" viewer -> ajax.GetToonsList.php -> full episode list
     // ==========
 
     private val jumpIdRegex = Regex("""jump\((\d+)\)""")
@@ -182,6 +187,38 @@ class Toon11 : ParsedHttpSource() {
         return if (q.isNullOrEmpty()) path else "$path?$q"
     }
 
+    private fun fetchToonsListAjax(viewerAbsUrl: String): Document {
+        val viewer = viewerAbsUrl.toHttpUrl()
+        val ajaxUrl = "$baseUrl/bbs/ajax.GetToonsList.php".toHttpUrl()
+
+        fun buildFormBody(): FormBody {
+            val b = FormBody.Builder()
+            for (i in 0 until viewer.querySize) {
+                b.add(viewer.queryParameterName(i), viewer.queryParameterValue(i) ?: "")
+            }
+            return b.build()
+        }
+
+        fun parseAjaxResponse(resp: Response): Document {
+            val body = resp.body?.string().orEmpty()
+            if (body.isBlank()) throw IOException("Empty ajax.GetToonsList.php response")
+            return Jsoup.parse(body, resp.request.url.toString())
+        }
+
+        val req = Request.Builder()
+            .url(ajaxUrl)
+            .post(buildFormBody())
+            .headers(headers.newBuilder().set("Referer", viewerAbsUrl).build())
+            .build()
+
+        return rateLimitedClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                throw IOException("ToonsListAjax failed: HTTP ${resp.code} url=${resp.request.url}")
+            }
+            parseAjaxResponse(resp)
+        }
+    }
+
     override fun chapterListParse(response: Response): List<SChapter> {
         val detailDoc = response.asJsoup()
 
@@ -190,33 +227,31 @@ class Toon11 : ParsedHttpSource() {
             ?.takeIf { it.isNotBlank() }
             ?: throw IOException("Missing first-episode link (a.btn-first-episode)")
 
-        val viewerDoc = rateLimitedClient.newCall(GET(firstEpisodeAbs, headers))
+        // Load viewer once (matches browser flow: page load -> ajax)
+        rateLimitedClient.newCall(GET(firstEpisodeAbs, headers))
             .execute()
             .use { resp ->
                 if (!resp.isSuccessful) {
                     throw IOException("Viewer request failed: HTTP ${resp.code} url=$firstEpisodeAbs")
                 }
-                resp.asJsoup()
             }
 
-        val buttons = viewerDoc.select("#sList ul.toonslist button[onclick]")
+        val ajaxDoc = fetchToonsListAjax(firstEpisodeAbs)
+        val buttons = ajaxDoc.select("ul.toonslist button[onclick*=jump]")
         if (buttons.isEmpty()) {
-            throw IOException("Missing episode list in viewer modal (#sList ul.toonslist)")
+            throw IOException("Missing episode list from ajax.GetToonsList.php (no ul.toonslist button[onclick*=jump])")
         }
 
-        // Modal list is typically 1화 -> ... ascending.
-        // Tachiyomi expects latest first (descending).
-        val template = firstEpisodeAbs.toHttpUrl()
-
         val entries = buttons.mapNotNull { btn ->
-            val onclick = btn.attr("onclick")
-            val wrId = jumpIdRegex.find(onclick)?.groupValues?.get(1) ?: return@mapNotNull null
-            val title = btn.text().trim()
+            val wrId = jumpIdRegex.find(btn.attr("onclick"))?.groupValues?.get(1) ?: return@mapNotNull null
+            val title = btn.text().trim() // "1화", "특별외전" 등 그대로
             wrId to title
         }
 
+        // HTML order is oldest -> newest. Reverse to newest -> oldest.
         val reversed = entries.asReversed()
         val total = reversed.size
+        val template = firstEpisodeAbs.toHttpUrl()
 
         return reversed.mapIndexed { idx, (wrId, title) ->
             val abs = template.newBuilder()
@@ -228,14 +263,19 @@ class Toon11 : ParsedHttpSource() {
             SChapter.create().apply {
                 setUrlWithoutDomain(rel)
                 name = title
-                // HTML 순서만 신뢰: 최신이 가장 큰 번호를 갖게 해서 정렬 안정화
+                // Title may not contain digits (e.g., 특별외전). Use stable order-based numbering.
                 chapter_number = (total - idx).toFloat()
                 date_upload = 0L
             }
         }
     }
 
-    // These are kept for compatibility with ParsedHttpSource, but chapterListParse() bypasses them.
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        return rateLimitedClient.newCall(pageListRequest(chapter))
+            .asObservableSuccess()
+            .map { response -> pageListParse(response.asJsoup()) }
+    }
+
     override fun chapterListSelector() = "#comic-episode-list > li"
 
     override fun chapterFromElement(element: Element): SChapter {
@@ -262,18 +302,13 @@ class Toon11 : ParsedHttpSource() {
         return date?.time ?: 0L
     }
 
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return rateLimitedClient.newCall(pageListRequest(chapter))
-            .asObservableSuccess()
-            .map { response -> pageListParse(response.asJsoup()) }
-    }
-
     override fun pageListRequest(chapter: SChapter): Request {
         return GET(baseUrl + "/bbs" + chapter.url, headers)
     }
 
     override fun pageListParse(document: Document): List<Page> {
-        val rawImageLinks = document.selectFirst("script + script[type^=text/javascript]:not([src])")!!.data()
+        val rawImageLinks =
+            document.selectFirst("script + script[type^=text/javascript]:not([src])")!!.data()
         val imgList = extractList(rawImageLinks)
 
         return imgList.mapIndexed { i, img ->
@@ -303,8 +338,11 @@ class Toon11 : ParsedHttpSource() {
 
     class SelectFilterOption(val name: String, val value: String)
 
-    abstract class SelectFilter(name: String, private val options: List<SelectFilterOption>, default: Int = 0) :
-        Filter.Select<String>(name, options.map { it.name }.toTypedArray(), default) {
+    abstract class SelectFilter(
+        name: String,
+        private val options: List<SelectFilterOption>,
+        default: Int = 0,
+    ) : Filter.Select<String>(name, options.map { it.name }.toTypedArray(), default) {
         val selected: String
             get() = options[state].value
     }
