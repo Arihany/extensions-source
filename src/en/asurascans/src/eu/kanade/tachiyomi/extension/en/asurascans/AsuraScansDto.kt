@@ -19,38 +19,40 @@ class FilterItemDto(
 @Serializable
 class PageDto(
     val order: Int,
-    val url: String,
+    val url: String = "",
+    val id: Int = 0,
 )
 
 @Serializable
-class UnlockRequestDto(
-    @SerialName("chapterId")
-    val chapterId: Int,
+class ChapterDataDto(
+    val id: Int,
+    @SerialName("is_early_access") val isEarlyAccess: Boolean = false,
+    val pages: List<PageDto> = emptyList(),
 )
 
 @Serializable
 class UnlockResponseDto(
     val success: Boolean,
-    val data: UnlockDataDto? = null,
-    val message: String? = null,
+    val data: UnlockDataDto,
 )
 
 @Serializable
 class UnlockDataDto(
     val id: Int,
-    val name: Int,
-    val title: String? = null,
-    @SerialName("is_early_access")
-    val isEarlyAccess: Boolean,
-    @SerialName("unlock_token")
-    val unlockToken: String? = null,
-    val pages: List<UnlockPageDto> = emptyList(),
+    @SerialName("unlock_token") val unlockToken: String,
+    @SerialName("is_early_access") val isEarlyAccess: Boolean,
+    val pages: List<PageDto>,
 )
 
 @Serializable
-class UnlockPageDto(
-    val order: Int,
-    val id: Int,
+class MediaResponseDto(
+    val data: String,
+    @SerialName("content-type") val contentType: String = "",
+)
+
+@Serializable
+class UnlockRequestDto(
+    val chapterId: Int,
 )
 
 @Serializable
@@ -61,11 +63,4 @@ class MediaRequestDto(
     val chapterId: Int,
     val token: String,
     val quality: String,
-)
-
-@Serializable
-class MediaResponseDto(
-    val data: String,
-    @SerialName("content-type")
-    val contentType: String? = null,
 )
