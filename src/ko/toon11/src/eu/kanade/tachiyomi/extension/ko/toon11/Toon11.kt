@@ -29,7 +29,7 @@ import java.util.Locale
 class Toon11 : ParsedHttpSource() {
 
     override val name = "cookmana"
-    override val baseUrl = "https://www.cookmana.com"
+    override val baseUrl = "https://cookmana.com"
     override val lang = "ko"
     override val supportsLatest = true
 
@@ -54,7 +54,7 @@ class Toon11 : ParsedHttpSource() {
      */
     private val baseClient: OkHttpClient = network.client.newBuilder()
 //        .dispatcher(limiterDispatcher)
-        .dns(FilteringIPv4Dns(network.client.dns))
+        // .dns(FilteringIPv4Dns(network.client.dns))
         .addInterceptor(FixupHeadersInterceptor(baseUrl))
         .build()
 
