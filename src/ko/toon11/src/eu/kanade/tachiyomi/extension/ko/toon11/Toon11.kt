@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
@@ -51,6 +52,7 @@ class Toon11 : ParsedHttpSource() {
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .dispatcher(limiterDispatcher)
+        .apply { rateLimit(RATE_LIMIT_PERMITS, RATE_LIMIT_PERIOD_SECONDS) }
         .addInterceptor(FixupHeadersInterceptor(baseUrl))
         .build()
 
@@ -342,6 +344,11 @@ class Toon11 : ParsedHttpSource() {
     }
 
     private companion object {
+        // NewToki 스타일 그대로: rateLimit(permits, periodSeconds)
+        // 값은 서버 상태 보면서 니가 알아서 바꿔. (보통 period는 "초"로 쓰는 패턴)
+        private const val RATE_LIMIT_PERMITS = 1
+        private const val RATE_LIMIT_PERIOD_SECONDS = 2L
+
         private fun isImageRequest(request: Request): Boolean {
             val p = request.url.encodedPath.lowercase(Locale.US)
             return p.endsWith(".webp") ||
