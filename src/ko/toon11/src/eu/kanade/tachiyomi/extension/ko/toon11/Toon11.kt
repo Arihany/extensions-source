@@ -384,7 +384,7 @@ class Toon11 : ParsedHttpSource() {
     private companion object {
         // RateLimit
         private const val RATE_LIMIT_PERMITS = 1
-        private const val RATE_LIMIT_PERIOD_SECONDS = 1L
+        private const val RATE_LIMIT_PERIOD_SECONDS = 2L
 
         private fun isImageRequest(request: Request): Boolean {
             val p = request.url.encodedPath.lowercase(Locale.US)
