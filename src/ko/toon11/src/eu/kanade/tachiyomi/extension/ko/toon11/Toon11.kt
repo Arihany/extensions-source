@@ -1,70 +1,51 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
-import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.Headers
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import rx.Observable
+import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.ArrayList
+import java.util.Date
 import java.util.Locale
 
 class Toon11 : ParsedHttpSource() {
 
-    override val name = "cookmana"
-    override val baseUrl = "https://cookmana.com"
+    override val name = "11toon"
+
+    override val baseUrl = "https://www.11toon.com"
+
     override val lang = "ko"
+
     override val supportsLatest = true
 
-    // NewToki처럼: 최소 헤더만 (Referer만)
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
+    override val client: OkHttpClient = network.cloudflareClient
 
-    // 도메인/네트워크 장난 제거: 인터셉터/DNS 손대지 않음
-    private val baseClient: OkHttpClient = network.client.newBuilder().build()
+    override fun popularMangaSelector() = "li[data-id]"
 
-    private val rateLimitedClient: OkHttpClient = baseClient.newBuilder()
-        // .apply { rateLimit(RATE_LIMIT_PERMITS, RATE_LIMIT_PERIOD_SECONDS) }
-        .build()
+    override fun latestUpdatesSelector() = popularMangaSelector()
 
-    override val client: OkHttpClient = baseClient
+    override fun popularMangaRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
 
-    // ---------- Requests ----------
-    private val latestBase = "$baseUrl/lastest"
-    private val popularBase = "$baseUrl/popular"
-
-    override fun popularMangaRequest(page: Int): Request {
-        return GET(popularBase, headers)
-    }
-
-    override fun latestUpdatesRequest(page: Int): Request {
-        // Target API: https://cookmana.com/api/lastest/list?page=2&type=0&pageSize=102
-        val url = "$baseUrl/api/lastest/list".toHttpUrl().newBuilder().apply {
-            addQueryParameter("page", page.toString())
-            addQueryParameter("type", "0")
-            addQueryParameter("pageSize", "102")
-        }.build()
-        return GET(url, headers)
-    }
+    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&sord=&type=upd&page=$page", headers)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         return if (query.isNotBlank()) {
-            val url = "$baseUrl/search".toHttpUrl().newBuilder().apply {
-                addQueryParameter("key", query)
-                if (page > 1) addQueryParameter("page", page.toString())
+            val url = "$baseUrl/bbs/search_stx.php".toHttpUrl().newBuilder().apply {
+                addQueryParameter("stx", query)
             }.build()
             GET(url, headers)
         } else {
@@ -84,217 +65,145 @@ class Toon11 : ParsedHttpSource() {
             val url = urlString.toHttpUrl().newBuilder().apply {
                 addQueryParameter("is_over", isOver)
                 if (page > 1) addQueryParameter("page", page.toString())
-                if (genre.isNotEmpty()) addQueryParameter("type", genre)
+                if (genre.isNotEmpty()) addQueryParameter("sca", genre)
             }.build()
 
             GET(url, headers)
         }
     }
 
-    // ---------- fetch: 전부 rateLimitedClient로 ----------
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
-        return rateLimitedClient.newCall(popularMangaRequest(page))
-            .asObservableSuccess()
-            .map(::popularMangaParse)
+    override fun popularMangaFromElement(element: Element) = SManga.create().apply {
+        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
+        title = element.selectFirst(".homelist-title")!!.text()
+        thumbnail_url = element.selectFirst(".homelist-thumb")?.absUrl("data-mobile-image")
     }
 
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
-        return rateLimitedClient.newCall(latestUpdatesRequest(page))
-            .asObservableSuccess()
-            .map(::latestUpdatesParse)
+    override fun latestUpdatesFromElement(element: Element) = SManga.create().apply {
+        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
+        title = element.selectFirst(".homelist-title")!!.text()
+        element.selectFirst(".homelist-thumb")?.also {
+            thumbnail_url = "https:" + it.attr("style").substringAfter("url('").substringBefore("')")
+        }
     }
 
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        return rateLimitedClient.newCall(searchMangaRequest(page, query, filters))
-            .asObservableSuccess()
-            .map(::searchMangaParse)
-    }
+    override fun popularMangaNextPageSelector() = ".pg_end"
 
-    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
-        return rateLimitedClient.newCall(mangaDetailsRequest(manga))
-            .asObservableSuccess()
-            .map { response ->
-                mangaDetailsParse(response.asJsoup()).apply { initialized = true }
-            }
-    }
+    override fun latestUpdatesNextPageSelector() = popularMangaNextPageSelector()
 
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> {
-        return rateLimitedClient.newCall(chapterListRequest(manga))
-            .asObservableSuccess()
-            .map(::chapterListParse)
-    }
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return rateLimitedClient.newCall(pageListRequest(chapter))
-            .asObservableSuccess()
-            .map { response -> pageListParse(response.asJsoup()) }
-    }
-
-    // ---------- Selectors ----------
-    override fun popularMangaSelector() = ".newm-boxo > li"
-    override fun latestUpdatesSelector() = popularMangaSelector()
     override fun searchMangaSelector() = popularMangaSelector()
 
-    override fun popularMangaNextPageSelector(): String? = null
-    override fun latestUpdatesNextPageSelector() = ".mf-Pagination-wrap > button:last-child svg"
-    override fun searchMangaNextPageSelector() = latestUpdatesNextPageSelector()
-
-    // ---------- URL helpers ----------
-    private fun normalizeImgUrl(raw: String): String? {
-        val u = raw.trim()
-        if (u.isBlank()) return null
-        return when {
-            u.startsWith("http://") || u.startsWith("https://") -> u
-            u.startsWith("//") -> "https:$u"
-            u.startsWith("/") -> baseUrl + u
-            else -> u
+    override fun searchMangaFromElement(element: Element) = SManga.create().apply {
+        title = element.selectFirst(".homelist-title")!!.text()
+        val dataId = element.attr("data-id")
+        setUrlWithoutDomain("$baseUrl/bbs/board.php?bo_table=toons&stx=$title&is=$dataId")
+        element.selectFirst(".homelist-thumb")?.also {
+            thumbnail_url = "https:" + it.attr("style").substringAfter("url('").substringBefore("')")
         }
     }
 
-    // ---------- Manga parsing ----------
-    override fun popularMangaFromElement(element: Element) = SManga.create().apply {
-        val linkElement = element.selectFirst("a")!!
-        val imgElement = element.selectFirst("img.lazyImg")
-        val titleElement = element.selectFirst(".new-box-ttt span")
+    override fun searchMangaNextPageSelector() = popularMangaNextPageSelector()
 
-        title = titleElement?.text() ?: imgElement?.attr("alt") ?: "Unknown"
-        url = linkElement.attr("href")
-
-        val imgSrc = imgElement?.attr("data-src")?.takeIf { it.isNotBlank() }
-            ?: imgElement?.attr("src")
-
-        thumbnail_url = imgSrc?.let { normalizeImgUrl(it) }
-    }
-
-    override fun latestUpdatesFromElement(element: Element) = popularMangaFromElement(element)
-    override fun searchMangaFromElement(element: Element) = popularMangaFromElement(element)
-
-    // ---------- Details ----------
     override fun mangaDetailsParse(document: Document): SManga {
         return SManga.create().apply {
-            val infoSection = document.selectFirst(".dt-left-tt")
-            title = infoSection?.selectFirst("h1")?.text() ?: "Unknown"
-
-            // Thumbnail from style="background-image: url('...')"
-            val bgImg = document.selectFirst(".dt-mn-bgimg")?.attr("style")
-            val bgUrl = bgImg?.substringAfter("url('")?.substringBefore("')")
-                ?: bgImg?.substringAfter("url(")?.substringBefore(")")
-            thumbnail_url = bgUrl?.let { normalizeImgUrl(it) }
-
-            author = infoSection?.select("div.detail-title1 p a")?.text()
-            genre = infoSection?.select("div.detail-title1 span a")?.joinToString { it.text().removePrefix("#") }
-            description = document.selectFirst("div.detail-title2 p")?.text()
-
-            status = SManga.ONGOING
+            title = document.selectFirst("h2.title")!!.text()
+            thumbnail_url = document.selectFirst("img.banner")?.absUrl("src")
+            document.selectFirst("span:contains(분류) + span")?.also { status = parseStatus(it.text()) }
+            document.selectFirst("span:contains(작가) + span")?.also { author = it.text() }
+            document.selectFirst("span:contains(소개) + span")?.also { description = it.text() }
+            document.selectFirst("span:contains(장르) + span")?.also { genre = it.text().split(",").joinToString() }
         }
     }
 
-    override fun chapterListRequest(manga: SManga): Request {
-        val id = manga.url.trimEnd('/').substringAfterLast('/')
-        val apiUrl = "$baseUrl/api/episode/list/$id".toHttpUrl().newBuilder()
-            .addQueryParameter("page", "1")
-            .addQueryParameter("order", "desc")
-            .build()
-
-        return GET(apiUrl, headers)
+    private fun parseStatus(element: String): Int = when {
+        "완결" in element -> SManga.COMPLETED
+        "주간" in element || "월간" in element || "연재" in element || "격주" in element || "격월" in element || "비정기" in element -> SManga.ONGOING
+        else -> SManga.UNKNOWN
     }
 
-    // ---------- Chapters ----------
-    private tailrec fun parseChapters(mangaId: String, currentUrl: String, chapters: ArrayList<SChapter>) {
-        val nextResponse = rateLimitedClient.newCall(GET(currentUrl, headers)).execute()
-        val htmlFragment = nextResponse.body.string()
-        val document = org.jsoup.Jsoup.parseBodyFragment(htmlFragment)
-
-        document.select(chapterListSelector()).forEach {
+    private tailrec fun parseChapters(nextURL: String, chapters: ArrayList<SChapter>) {
+        val newpage = fetchPagesFromNav(nextURL)
+        newpage.select(chapterListSelector()).forEach {
             chapters.add(chapterFromElement(it))
         }
-
-        val nextButton = document.selectFirst(".mf-Pagination-wrap button.active + button[data-page]")
-        if (nextButton != null) {
-            val nextPageNum = nextButton.attr("data-page")
-            if (nextPageNum.isNotEmpty()) {
-                val nextUrl = "$baseUrl/api/episode/list/$mangaId".toHttpUrl().newBuilder()
-                    .addQueryParameter("page", nextPageNum)
-                    .addQueryParameter("order", "desc")
-                    .build()
-                    .toString()
-
-                parseChapters(mangaId, nextUrl, chapters)
-            }
-        }
+        val newURL = newpage.selectFirst(".pg_current ~ .pg_page")?.absUrl("href")
+        if (!newURL.isNullOrBlank()) parseChapters(newURL, chapters)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val htmlFragment = response.body.string()
-        val document = org.jsoup.Jsoup.parseBodyFragment(htmlFragment)
+        val document = response.asJsoup()
+        val nav = document.selectFirst("span.pg")
         val chapters = ArrayList<SChapter>()
 
         document.select(chapterListSelector()).forEach {
             chapters.add(chapterFromElement(it))
         }
 
-        val pathSegments = response.request.url.pathSegments
-        val mangaId = pathSegments.getOrNull(pathSegments.size - 1) ?: ""
-
-        val nextButton = document.selectFirst(".mf-Pagination-wrap button.active + button[data-page]")
-        if (nextButton != null && mangaId.isNotEmpty()) {
-            val nextPageNum = nextButton.attr("data-page")
-            if (nextPageNum.isNotEmpty()) {
-                val nextUrl = "$baseUrl/api/episode/list/$mangaId".toHttpUrl().newBuilder()
-                    .addQueryParameter("page", nextPageNum)
-                    .addQueryParameter("order", "desc")
-                    .build()
-                    .toString()
-
-                parseChapters(mangaId, nextUrl, chapters)
-            }
+        if (nav == null) {
+            return chapters
         }
+
+        val pg2url = nav.selectFirst(".pg_current ~ .pg_page")!!.absUrl("href")
+
+        // recursively build the chapter list
+
+        parseChapters(pg2url, chapters)
+
         return chapters
     }
 
-    override fun chapterListSelector() = "ul.mEpisodeList > li"
+    private fun fetchPagesFromNav(url: String) = client.newCall(GET(url, headers)).execute().asJsoup()
+
+    override fun chapterListSelector() = "#comic-episode-list > li"
 
     override fun chapterFromElement(element: Element): SChapter {
+        val urlEl = element.selectFirst("button")
+        val dateEl = element.selectFirst(".free-date")
+
         return SChapter.create().apply {
-            val link = element.selectFirst("a")!!
-            url = link.attr("href").substringBefore("?order=")
-
-            val titleHeader = element.selectFirst(".m-episode-list-item-title")
-            name = titleHeader?.text()?.trim() ?: "화"
-
-            val dateText = element.selectFirst(".dt-le-c > p")?.text()?.trim()
-            date_upload = parseChapterDate(dateText)
+            urlEl!!.also {
+                setUrlWithoutDomain(it.attr("onclick").substringAfter("location.href='.").substringBefore("'"))
+                name = it.selectFirst(".episode-title")!!.text()
+            }
+            dateEl?.also { date_upload = dateParse(it.text()) }
         }
     }
 
-    private fun parseChapterDate(date: String?): Long {
-        if (date.isNullOrBlank()) return 0L
-        return try {
-            val dateFormat = SimpleDateFormat("yyyy.MM.dd", Locale.KOREA)
-            dateFormat.parse(date)?.time ?: 0L
-        } catch (e: Exception) {
-            0L
+    private val dateFormat = SimpleDateFormat("yy.MM.dd", Locale.ENGLISH)
+
+    private fun dateParse(dateAsString: String): Long {
+        val date: Date? = try {
+            dateFormat.parse(dateAsString)
+        } catch (e: ParseException) {
+            null
         }
+        return date?.time ?: 0L
     }
 
-    // ---------- Pages ----------
     override fun pageListRequest(chapter: SChapter): Request {
-        return GET(baseUrl + chapter.url, headers)
+        return GET(baseUrl + "/bbs" + chapter.url, headers)
     }
 
     override fun pageListParse(document: Document): List<Page> {
-        return document.select(".lazy-img-wrap img").mapIndexed { i, element ->
-            val url = element.attr("data-src").takeIf { it.isNotBlank() }
-                ?: element.attr("data-src-r").takeIf { it.isNotBlank() }
-                ?: element.attr("src")
+        val rawImageLinks = document.selectFirst("script + script[type^=text/javascript]:not([src])")!!.data()
+        val imgList = extractList(rawImageLinks)
 
-            Page(i, imageUrl = normalizeImgUrl(url ?: "")!!)
+        return imgList.mapIndexed { i, img ->
+            Page(i, imageUrl = "https:$img")
         }
+    }
+
+    private val imgListRegex = """img_list\s*=\s*(\[.*?])""".toRegex(RegexOption.DOT_MATCHES_ALL)
+
+    private fun extractList(jsString: String): List<String> {
+        val matchResult = imgListRegex.find(jsString)
+        val listString = matchResult?.groupValues?.get(1) ?: return emptyList()
+        return Json.decodeFromString<List<String>>(listString)
     }
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
 
-    // ---------- Filters ----------
+    // Filters
+
     override fun getFilterList() = FilterList(
         Filter.Header("Note: can't combine search query with filters, status filter only has effect in 인기만화"),
         Filter.Separator(),
@@ -303,33 +212,20 @@ class Toon11 : ParsedHttpSource() {
         GenreFilter(getGenreList, 0),
     )
 
-    private class SortFilter(vals: List<SelectFilterOption>, state: Int = 0) :
-        SelectFilter("정렬", vals, state)
+    class SelectFilterOption(val name: String, val value: String)
 
-    private class StatusFilter(vals: List<SelectFilterOption>, state: Int = 0) :
-        SelectFilter("Status", vals, state)
-
-    private class GenreFilter(vals: List<SelectFilterOption>, state: Int = 0) :
-        SelectFilter("장르", vals, state)
-
-    open class SelectFilter(
-        displayName: String,
-        private val vals: List<SelectFilterOption>,
-        state: Int = 0,
-    ) : Filter.Select<String>(
-        displayName,
-        vals.map { it.name }.toTypedArray(),
-        state,
-    ) {
+    abstract class SelectFilter(name: String, private val options: List<SelectFilterOption>, default: Int = 0) : Filter.Select<String>(name, options.map { it.name }.toTypedArray(), default) {
         val selected: String
-            get() = vals[state].value
+            get() = options[state].value
     }
 
-    data class SelectFilterOption(val name: String, val value: String)
+    class SortFilter(options: List<SelectFilterOption>, default: Int) : SelectFilter("Sort", options, default)
+    class StatusFilter(options: List<SelectFilterOption>, default: Int) : SelectFilter("Status", options, default)
+    class GenreFilter(options: List<SelectFilterOption>, default: Int) : SelectFilter("Genre", options, default)
 
     private val getSortList = listOf(
-        SelectFilterOption("인기만화", popularBase),
-        SelectFilterOption("최신만화", latestBase),
+        SelectFilterOption("인기만화", "$baseUrl/bbs/board.php?bo_table=toon_c"),
+        SelectFilterOption("최신만화", "$baseUrl/bbs/board.php?bo_table=toon_c&tablename=최신만화&type=upd"),
     )
 
     private val getStatusList = listOf(
@@ -340,33 +236,33 @@ class Toon11 : ParsedHttpSource() {
     private val getGenreList = listOf(
         SelectFilterOption("전체", ""),
         SelectFilterOption("SF", "SF"),
+        SelectFilterOption("무협", "무협"),
         SelectFilterOption("TS", "TS"),
         SelectFilterOption("개그", "개그"),
         SelectFilterOption("드라마", "드라마"),
-        SelectFilterOption("코미디", "코미디"),
+        SelectFilterOption("러브코미디", "러브코미디"),
         SelectFilterOption("먹방", "먹방"),
         SelectFilterOption("백합", "백합"),
         SelectFilterOption("붕탁", "붕탁"),
-        SelectFilterOption("순정", "순정"),
         SelectFilterOption("스릴러", "스릴러"),
         SelectFilterOption("스포츠", "스포츠"),
         SelectFilterOption("시대", "시대"),
         SelectFilterOption("액션", "액션"),
-        SelectFilterOption("인기", "인기"),
-        SelectFilterOption("일상+치유", "일상+치유"),
+        SelectFilterOption("순정", "순정"),
+        SelectFilterOption("일상+치유", "일상%2B치유"),
         SelectFilterOption("추리", "추리"),
         SelectFilterOption("판타지", "판타지"),
         SelectFilterOption("학원", "학원"),
         SelectFilterOption("호러", "호러"),
         SelectFilterOption("BL", "BL"),
         SelectFilterOption("17", "17"),
-        SelectFilterOption("무협", "무협"),
-        SelectFilterOption("러브코미디", "러브코미디"),
         SelectFilterOption("이세계", "이세계"),
         SelectFilterOption("전생", "전생"),
         SelectFilterOption("라노벨", "라노벨"),
         SelectFilterOption("애니화", "애니화"),
         SelectFilterOption("TL", "TL"),
         SelectFilterOption("공포", "공포"),
+        SelectFilterOption("하렘", "하렘"),
+        SelectFilterOption("요리", "요리"),
     )
 }
