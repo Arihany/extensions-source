@@ -1,7 +1,7 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
+import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -197,7 +197,7 @@ class Toon11 : ParsedHttpSource() {
         return SManga.create().apply {
             val infoSection = document.selectFirst(".dt-left-tt")
             title = infoSection?.selectFirst("h1")?.text() ?: "Unknown"
-            
+
             // Thumbnail from style="background-image: url('...')"
             val bgImg = document.selectFirst(".dt-mn-bgimg")?.attr("style")
             val bgUrl = bgImg?.substringAfter("url('")?.substringBefore("')")
@@ -222,7 +222,7 @@ class Toon11 : ParsedHttpSource() {
             .addQueryParameter("page", "1")
             .addQueryParameter("order", "desc")
             .build()
-            
+
         return GET(apiUrl, headers)
     }
 
@@ -286,7 +286,6 @@ class Toon11 : ParsedHttpSource() {
         }
         return chapters
     }
-
     override fun chapterListSelector() = "ul.mEpisodeList > li"
 
     override fun chapterFromElement(element: Element): SChapter {
@@ -343,7 +342,6 @@ class Toon11 : ParsedHttpSource() {
                 b.header("Referer", "$baseUrl/")
                 b.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
             }
-
             return chain.proceed(b.build())
         }
     }
