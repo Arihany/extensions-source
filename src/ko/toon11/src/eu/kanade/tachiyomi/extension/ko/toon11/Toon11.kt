@@ -218,7 +218,7 @@ class Toon11 : ParsedHttpSource() {
             .addQueryParameter("page", "1")
             .addQueryParameter("order", "desc")
             .build()
-            
+
         return GET(apiUrl, headers)
     }
 
