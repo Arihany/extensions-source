@@ -47,9 +47,14 @@ class Toon11 : ParsedHttpSource() {
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         )
 
-    private val baseClient: OkHttpClient = network.cloudflareClient.newBuilder()
+    /**
+     * 핵심 변경:
+     * - network.cloudflareClient -> network.client (cloudflareClient는 deprecated)
+     * - DNS를 Dns.SYSTEM로 고정하지 않고, 앱 네트워크 설정(DoH 등)을 delegate로 받아 IPv4만 선호하도록 필터링
+     */
+    private val baseClient: OkHttpClient = network.client.newBuilder()
 //        .dispatcher(limiterDispatcher)
-        .dns(IPv4Dns())
+        .dns(FilteringIPv4Dns(network.client.dns))
         .addInterceptor(FixupHeadersInterceptor(baseUrl))
         .build()
 
@@ -283,6 +288,7 @@ class Toon11 : ParsedHttpSource() {
         }
         return chapters
     }
+
     override fun chapterListSelector() = "ul.mEpisodeList > li"
 
     override fun chapterFromElement(element: Element): SChapter {
@@ -346,14 +352,20 @@ class Toon11 : ParsedHttpSource() {
         }
     }
 
-    private class IPv4Dns : Dns {
+    /**
+     * delegate DNS(앱 설정: DoH/프록시 등)를 그대로 사용하면서,
+     * 결과가 IPv4/IPv6 혼합이면 IPv4를 우선 사용하도록 필터링.
+     *
+     * - IPv4가 하나라도 있으면 IPv4만 반환
+     * - IPv4가 없으면 원본 그대로 반환 (IPv6-only 환경 대비)
+     */
+    private class FilteringIPv4Dns(
+        private val delegate: Dns,
+    ) : Dns {
         override fun lookup(hostname: String): List<InetAddress> {
-            return try {
-                Dns.SYSTEM.lookup(hostname).filter { it is Inet4Address }
-            } catch (e: Exception) {
-                // Fallback to system if filtering fails or returns empty (though rare)
-                Dns.SYSTEM.lookup(hostname)
-            }
+            val all = delegate.lookup(hostname)
+            val v4 = all.filterIsInstance<Inet4Address>()
+            return if (v4.isNotEmpty()) v4 else all
         }
     }
 
