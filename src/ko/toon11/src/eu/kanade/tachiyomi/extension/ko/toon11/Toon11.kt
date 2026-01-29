@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
-
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -11,7 +10,6 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -205,7 +203,7 @@ class Toon11 : ParsedHttpSource() {
             author = infoSection?.select("div.detail-title1 p a")?.text()
             genre = infoSection?.select("div.detail-title1 span a")?.joinToString { it.text().removePrefix("#") }
             description = document.selectFirst("div.detail-title2 p")?.text()
-            
+
             // Status detection not explicitly found in provided HTML, defaulting to ONGOING/UNKNOWN
             // If "완결" text appears in future, add logic here.
             status = SManga.ONGOING
@@ -238,7 +236,7 @@ class Toon11 : ParsedHttpSource() {
         // Pagination: API response usually contains the pagination HTML block too.
         // Check for next button
         val nextButton = document.selectFirst(".mf-Pagination-wrap button.active + button[data-page]")
-        
+
         if (nextButton != null) {
             val nextPageNum = nextButton.attr("data-page")
             if (nextPageNum.isNotEmpty()) {
@@ -247,7 +245,7 @@ class Toon11 : ParsedHttpSource() {
                     .addQueryParameter("order", "desc")
                     .build()
                     .toString()
-                
+
                 parseChapters(mangaId, nextUrl, chapters)
             }
         }
@@ -266,7 +264,7 @@ class Toon11 : ParsedHttpSource() {
         // Parse manga ID from the original API request URL to use in recursion
         // Request URL example: .../api/episode/list/3737?page=1...
         val pathSegments = response.request.url.pathSegments
-        val mangaId = pathSegments.getOrNull(pathSegments.size - 1) ?: "" 
+        val mangaId = pathSegments.getOrNull(pathSegments.size - 1) ?: ""
         // pathSegments for /api/episode/list/3737 are [api, episode, list, 3737]
 
         val nextButton = document.selectFirst(".mf-Pagination-wrap button.active + button[data-page]")
@@ -278,7 +276,7 @@ class Toon11 : ParsedHttpSource() {
                     .addQueryParameter("order", "desc")
                     .build()
                     .toString()
-                    
+
                 parseChapters(mangaId, nextUrl, chapters)
             }
         }
@@ -395,11 +393,11 @@ class Toon11 : ParsedHttpSource() {
     open class SelectFilter(
         displayName: String,
         private val vals: List<SelectFilterOption>,
-        state: Int = 0
+        state: Int = 0,
     ) : Filter.Select<String>(
         displayName,
         vals.map { it.name }.toTypedArray(),
-        state
+        state,
     ) {
         val selected: String
             get() = vals[state].value
