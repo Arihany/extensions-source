@@ -19,6 +19,9 @@ import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
+import okhttp3.Dns
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.text.SimpleDateFormat
 import java.util.ArrayList
 import java.util.Locale
@@ -49,6 +52,7 @@ class Toon11 : ParsedHttpSource() {
 
     private val baseClient: OkHttpClient = network.cloudflareClient.newBuilder()
 //        .dispatcher(limiterDispatcher)
+        .dns(IPv4Dns())
         .addInterceptor(FixupHeadersInterceptor(baseUrl))
         .build()
 
@@ -193,7 +197,7 @@ class Toon11 : ParsedHttpSource() {
         return SManga.create().apply {
             val infoSection = document.selectFirst(".dt-left-tt")
             title = infoSection?.selectFirst("h1")?.text() ?: "Unknown"
-
+            
             // Thumbnail from style="background-image: url('...')"
             val bgImg = document.selectFirst(".dt-mn-bgimg")?.attr("style")
             val bgUrl = bgImg?.substringAfter("url('")?.substringBefore("')")
@@ -218,7 +222,7 @@ class Toon11 : ParsedHttpSource() {
             .addQueryParameter("page", "1")
             .addQueryParameter("order", "desc")
             .build()
-
+            
         return GET(apiUrl, headers)
     }
 
@@ -283,6 +287,7 @@ class Toon11 : ParsedHttpSource() {
         return chapters
     }
 
+
     override fun chapterListSelector() = "ul.mEpisodeList > li"
 
     override fun chapterFromElement(element: Element): SChapter {
@@ -316,8 +321,9 @@ class Toon11 : ParsedHttpSource() {
 
     override fun pageListParse(document: Document): List<Page> {
         return document.select(".lazy-img-wrap img").mapIndexed { i, element ->
-            val url = element.attr("src").takeIf { it.isNotBlank() }
-                ?: element.attr("data-src-r")
+            val url = element.attr("data-src").takeIf { it.isNotBlank() }
+                ?: element.attr("data-src-r").takeIf { it.isNotBlank() }
+                ?: element.attr("src")
 
             Page(i, imageUrl = normalizeImgUrl(url ?: "")!!)
         }
@@ -340,6 +346,18 @@ class Toon11 : ParsedHttpSource() {
             }
 
             return chain.proceed(b.build())
+        }
+
+    }
+
+    private class IPv4Dns : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            return try {
+                Dns.SYSTEM.lookup(hostname).filter { it is Inet4Address }
+            } catch (e: Exception) {
+                // Fallback to system if filtering fails or returns empty (though rare)
+                Dns.SYSTEM.lookup(hostname)
+            }
         }
     }
 
