@@ -19,17 +19,11 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.io.IOException
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.ArrayList
 import java.util.Date
 import java.util.Locale
-import java.util.TimeZone
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Semaphore
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.random.Random
 
 class Toon11 : ParsedHttpSource() {
 
@@ -41,7 +35,6 @@ class Toon11 : ParsedHttpSource() {
     override val lang = "ko"
     override val supportsLatest = true
 
-    // OkHttp 디스패처 자체 제한은 너무 빡세면 대기열만 길어짐. (실제 제한은 아래 세마포어가 담당)
     private val limiterDispatcher = Dispatcher().apply {
         maxRequests = 32
         maxRequestsPerHost = 8
@@ -58,12 +51,10 @@ class Toon11 : ParsedHttpSource() {
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .dispatcher(limiterDispatcher)
-        .addInterceptor(HostConcurrencyAndBackoffInterceptor())
         .addInterceptor(FixupHeadersInterceptor(baseUrl))
         .build()
 
     // ---------- Requests ----------
-    // 사용자 제공 RAW에 맞춤
     private val latestBase =
         "$baseUrl/bbs/board.php?bo_table=toon_c&type=upd&tablename=%EC%B5%9C%EC%8B%A0%EB%A7%8C%ED%99%94"
     private val popularBase =
@@ -239,15 +230,56 @@ class Toon11 : ParsedHttpSource() {
 
     override fun chapterListSelector() = "#comic-episode-list > li"
 
+    // onclick = "location.href='....'"
+    private val onclickHrefRegex = Regex("""location\.href\s*=\s*['"]([^'"]+)['"]""")
+
+    private fun extractOnclickHref(onclick: String): String? {
+        val m = onclickHrefRegex.find(onclick) ?: return null
+        return m.groupValues.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * 챕터 URL은 DB 키로 쓰이니까 "항상 같은 형태"로 통일해야 함.
+     * - 절대 URL -> path+query로 변환
+     * - ./ 제거
+     * - /bbs/ 프리픽스 제거 (pageListRequest에서 /bbs를 붙이므로)
+     * - 선행 '/' 강제
+     */
+    private fun canonicalizeChapterUrl(raw: String): String? {
+        var u = raw.trim()
+        if (u.isEmpty()) return null
+
+        if (u.startsWith("./")) u = u.removePrefix("./")
+
+        if (u.startsWith("http://") || u.startsWith("https://")) {
+            u = try {
+                val http = u.toHttpUrl()
+                val q = http.encodedQuery?.let { "?$it" }.orEmpty()
+                http.encodedPath + q
+            } catch (_: IllegalArgumentException) {
+                return null
+            }
+        }
+
+        if (u.startsWith("/bbs/")) u = u.removePrefix("/bbs/")
+        if (u.startsWith("bbs/")) u = u.removePrefix("bbs/")
+
+        if (!u.startsWith("/")) u = "/$u"
+        return u
+    }
+
     override fun chapterFromElement(element: Element): SChapter {
-        val urlEl = element.selectFirst("button")
+        val urlEl = element.selectFirst("button")!!
         val dateEl = element.selectFirst(".free-date")
 
+        val onclick = urlEl.attr("onclick").orEmpty()
+        val href = extractOnclickHref(onclick).orEmpty()
+        val canon = canonicalizeChapterUrl(href).orEmpty()
+
         return SChapter.create().apply {
-            urlEl!!.also {
-                setUrlWithoutDomain(it.attr("onclick").substringAfter("location.href='.").substringBefore("'"))
-                name = it.selectFirst(".episode-title")!!.text()
-            }
+            // 여기서 url이 흔들리면 "봤던 회차가 새 회차로 재등장"한다. 그러니 정규화 강제.
+            setUrlWithoutDomain(canon)
+            name = urlEl.selectFirst(".episode-title")!!.text()
             dateEl?.also { date_upload = dateParse(it.text()) }
         }
     }
@@ -265,7 +297,11 @@ class Toon11 : ParsedHttpSource() {
 
     // ---------- Pages ----------
     override fun pageListRequest(chapter: SChapter): Request {
-        return GET(baseUrl + "/bbs" + chapter.url, headers)
+        // 과거 DB에 "/bbs/..." 로 저장된 챕터가 남아있을 수 있어서 중복 방지
+        val u0 = chapter.url.trim()
+        val u = if (u0.startsWith("/")) u0 else "/$u0"
+        val path = if (u.startsWith("/bbs/")) u else "/bbs$u"
+        return GET(baseUrl + path, headers)
     }
 
     override fun pageListParse(document: Document): List<Page> {
@@ -294,136 +330,14 @@ class Toon11 : ParsedHttpSource() {
 
         override fun intercept(chain: Interceptor.Chain): Response {
             val req = chain.request()
-
-            val isImage = isImageRequest(req)
             val b = req.newBuilder()
 
-            if (isImage) {
+            if (isImageRequest(req)) {
                 b.header("Referer", "$baseUrl/")
                 b.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
             }
 
             return chain.proceed(b.build())
-        }
-    }
-
-    private class HostConcurrencyAndBackoffInterceptor(
-        private val imageConcurrency: Int = 5,
-        private val htmlConcurrency: Int = 2,
-        private val maxRetries: Int = 2,
-        private val baseBackoffMs: Long = 750L,
-    ) : Interceptor {
-
-        companion object {
-            private val hostNextAllowedAt = ConcurrentHashMap<String, AtomicLong>()
-
-            private val httpDateFormat = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).apply {
-                timeZone = TimeZone.getTimeZone("GMT")
-            }
-
-            private val imageSemaphore = Semaphore(5, true)
-            private val htmlSemaphore = Semaphore(2, true)
-        }
-
-        private fun isTransientServerCode(code: Int): Boolean {
-            return code == 429 || code == 503 || code == 502 || code == 504 || code == 408 ||
-                code == 520 || code == 521 || code == 522 || code == 524
-        }
-
-        private fun parseRetryAfterMs(response: Response, maxRetryAfterMs: Long = 60_000L): Long? {
-            val v = response.header("Retry-After")?.trim().orEmpty()
-            if (v.isEmpty()) return null
-
-            v.toLongOrNull()?.let { seconds ->
-                val ms = seconds * 1000L
-                return ms.coerceIn(0L, maxRetryAfterMs)
-            }
-
-            return try {
-                val whenMs = httpDateFormat.parse(v)?.time ?: return null
-                val now = System.currentTimeMillis()
-                val ms = (whenMs - now).coerceAtLeast(0L)
-                ms.coerceAtMost(maxRetryAfterMs)
-            } catch (_: Exception) {
-                null
-            }
-        }
-
-        private fun computeBackoffMs(attempt: Int, base: Long, maxBackoffMs: Long = 15_000L): Long {
-            val exp = base * (1L shl attempt).coerceAtMost(1L shl 10)
-            val jitter = Random.nextLong(0, 250)
-            return (exp + jitter).coerceAtMost(maxBackoffMs)
-        }
-
-        private fun getNextAllowedAt(host: String): Long {
-            return hostNextAllowedAt[host]?.get() ?: 0L
-        }
-
-        private fun bumpNextAllowedAt(host: String, newUntilMs: Long) {
-            val atom = hostNextAllowedAt.getOrPut(host) { AtomicLong(0L) }
-            while (true) {
-                val cur = atom.get()
-                if (newUntilMs <= cur) return
-                if (atom.compareAndSet(cur, newUntilMs)) return
-            }
-        }
-
-        private fun sleepMs(ms: Long) {
-            if (ms <= 0) return
-            try {
-                Thread.sleep(ms)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-        }
-
-        private fun semaphoreFor(request: Request): Semaphore {
-            return if (isImageRequest(request)) imageSemaphore else htmlSemaphore
-        }
-
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val request = chain.request()
-            val host = request.url.host
-
-            val sem = semaphoreFor(request)
-            sem.acquire()
-            try {
-                var attempt = 0
-                var lastException: IOException? = null
-                var lastErrorResponse: Response? = null
-
-                while (attempt <= maxRetries) {
-                    val until = getNextAllowedAt(host)
-                    val now = System.currentTimeMillis()
-                    sleepMs(until - now)
-
-                    lastErrorResponse?.close()
-                    try {
-                        val r = chain.proceed(request)
-                        if (!isTransientServerCode(r.code)) return r
-
-                        lastErrorResponse = r
-
-                        val retryAfter = parseRetryAfterMs(r)
-                        val waitMs = retryAfter ?: computeBackoffMs(attempt, baseBackoffMs)
-                        bumpNextAllowedAt(host, System.currentTimeMillis() + waitMs)
-
-                        if (attempt == maxRetries) return r
-                        sleepMs(waitMs)
-                    } catch (e: IOException) {
-                        // 취소/네트워크 에러는 여기서 "부채"로 누적시키면 다시 지옥으로 감
-                        lastException = e
-                        if (attempt == maxRetries) throw e
-                    }
-
-                    attempt++
-                }
-
-                lastErrorResponse?.let { return it }
-                throw lastException ?: IOException("Request failed after retries")
-            } finally {
-                sem.release()
-            }
         }
     }
 
