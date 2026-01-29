@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import okhttp3.Dns
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -19,7 +20,6 @@ import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
-import okhttp3.Dns
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.text.SimpleDateFormat
@@ -197,7 +197,7 @@ class Toon11 : ParsedHttpSource() {
         return SManga.create().apply {
             val infoSection = document.selectFirst(".dt-left-tt")
             title = infoSection?.selectFirst("h1")?.text() ?: "Unknown"
-
+            
             // Thumbnail from style="background-image: url('...')"
             val bgImg = document.selectFirst(".dt-mn-bgimg")?.attr("style")
             val bgUrl = bgImg?.substringAfter("url('")?.substringBefore("')")
@@ -222,7 +222,7 @@ class Toon11 : ParsedHttpSource() {
             .addQueryParameter("page", "1")
             .addQueryParameter("order", "desc")
             .build()
-
+            
         return GET(apiUrl, headers)
     }
 
@@ -287,7 +287,6 @@ class Toon11 : ParsedHttpSource() {
         return chapters
     }
 
-
     override fun chapterListSelector() = "ul.mEpisodeList > li"
 
     override fun chapterFromElement(element: Element): SChapter {
@@ -347,7 +346,6 @@ class Toon11 : ParsedHttpSource() {
 
             return chain.proceed(b.build())
         }
-
     }
 
     private class IPv4Dns : Dns {
