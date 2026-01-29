@@ -10,18 +10,14 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.Dns
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
-import java.net.Inet4Address
-import java.net.InetAddress
 import java.text.SimpleDateFormat
 import java.util.ArrayList
 import java.util.Locale
@@ -33,42 +29,22 @@ class Toon11 : ParsedHttpSource() {
     override val lang = "ko"
     override val supportsLatest = true
 
-//    private val limiterDispatcher = Dispatcher().apply {
-//        maxRequests = 32
-//        maxRequestsPerHost = 8
-//    }
-
-    private val fallbackThumbHost = "https://cookmana.com"
-
+    // NewToki처럼: 최소 헤더만 (Referer만)
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$baseUrl/")
-        .set(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        )
 
-    /**
-     * 핵심 변경:
-     * - network.cloudflareClient -> network.client (cloudflareClient는 deprecated)
-     * - DNS를 Dns.SYSTEM로 고정하지 않고, 앱 네트워크 설정(DoH 등)을 delegate로 받아 IPv4만 선호하도록 필터링
-     */
-    private val baseClient: OkHttpClient = network.client.newBuilder()
-//        .dispatcher(limiterDispatcher)
-        // .dns(FilteringIPv4Dns(network.client.dns))
-        .addInterceptor(FixupHeadersInterceptor(baseUrl))
-        .build()
+    // 도메인/네트워크 장난 제거: 인터셉터/DNS 손대지 않음
+    private val baseClient: OkHttpClient = network.client.newBuilder().build()
 
     private val rateLimitedClient: OkHttpClient = baseClient.newBuilder()
-//        .apply { rateLimit(RATE_LIMIT_PERMITS, RATE_LIMIT_PERIOD_SECONDS) }
+        // .apply { rateLimit(RATE_LIMIT_PERMITS, RATE_LIMIT_PERIOD_SECONDS) }
         .build()
 
     override val client: OkHttpClient = baseClient
 
     // ---------- Requests ----------
-    private val latestBase =
-        "$baseUrl/lastest"
-    private val popularBase =
-        "$baseUrl/popular"
+    private val latestBase = "$baseUrl/lastest"
+    private val popularBase = "$baseUrl/popular"
 
     override fun popularMangaRequest(page: Int): Request {
         return GET(popularBase, headers)
@@ -115,7 +91,7 @@ class Toon11 : ParsedHttpSource() {
         }
     }
 
-    // ---------- HTML fetch는 전부 rateLimitedClient로 ----------
+    // ---------- fetch: 전부 rateLimitedClient로 ----------
     override fun fetchPopularManga(page: Int): Observable<MangasPage> {
         return rateLimitedClient.newCall(popularMangaRequest(page))
             .asObservableSuccess()
@@ -163,7 +139,7 @@ class Toon11 : ParsedHttpSource() {
     override fun latestUpdatesNextPageSelector() = ".mf-Pagination-wrap > button:last-child svg"
     override fun searchMangaNextPageSelector() = latestUpdatesNextPageSelector()
 
-    // ---------- URL / Thumbnail helpers ----------
+    // ---------- URL helpers ----------
     private fun normalizeImgUrl(raw: String): String? {
         val u = raw.trim()
         if (u.isBlank()) return null
@@ -191,7 +167,6 @@ class Toon11 : ParsedHttpSource() {
     }
 
     override fun latestUpdatesFromElement(element: Element) = popularMangaFromElement(element)
-
     override fun searchMangaFromElement(element: Element) = popularMangaFromElement(element)
 
     // ---------- Details ----------
@@ -210,15 +185,11 @@ class Toon11 : ParsedHttpSource() {
             genre = infoSection?.select("div.detail-title1 span a")?.joinToString { it.text().removePrefix("#") }
             description = document.selectFirst("div.detail-title2 p")?.text()
 
-            // Status detection not explicitly found in provided HTML, defaulting to ONGOING/UNKNOWN
-            // If "완결" text appears in future, add logic here.
             status = SManga.ONGOING
         }
     }
 
     override fun chapterListRequest(manga: SManga): Request {
-        // manga.url example: /episode/3737 or https://cookmana.com/episode/3737
-        // target API: https://cookmana.com/api/episode/list/3737?page=1&order=desc
         val id = manga.url.trimEnd('/').substringAfterLast('/')
         val apiUrl = "$baseUrl/api/episode/list/$id".toHttpUrl().newBuilder()
             .addQueryParameter("page", "1")
@@ -231,7 +202,6 @@ class Toon11 : ParsedHttpSource() {
     // ---------- Chapters ----------
     private tailrec fun parseChapters(mangaId: String, currentUrl: String, chapters: ArrayList<SChapter>) {
         val nextResponse = rateLimitedClient.newCall(GET(currentUrl, headers)).execute()
-        // API returns HTML fragment (list items), wrap it to make a valid document
         val htmlFragment = nextResponse.body.string()
         val document = org.jsoup.Jsoup.parseBodyFragment(htmlFragment)
 
@@ -239,10 +209,7 @@ class Toon11 : ParsedHttpSource() {
             chapters.add(chapterFromElement(it))
         }
 
-        // Pagination: API response usually contains the pagination HTML block too.
-        // Check for next button
         val nextButton = document.selectFirst(".mf-Pagination-wrap button.active + button[data-page]")
-
         if (nextButton != null) {
             val nextPageNum = nextButton.attr("data-page")
             if (nextPageNum.isNotEmpty()) {
@@ -258,7 +225,6 @@ class Toon11 : ParsedHttpSource() {
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        // The first response is from chapterListRequest (API)
         val htmlFragment = response.body.string()
         val document = org.jsoup.Jsoup.parseBodyFragment(htmlFragment)
         val chapters = ArrayList<SChapter>()
@@ -267,11 +233,8 @@ class Toon11 : ParsedHttpSource() {
             chapters.add(chapterFromElement(it))
         }
 
-        // Parse manga ID from the original API request URL to use in recursion
-        // Request URL example: .../api/episode/list/3737?page=1...
         val pathSegments = response.request.url.pathSegments
         val mangaId = pathSegments.getOrNull(pathSegments.size - 1) ?: ""
-        // pathSegments for /api/episode/list/3737 are [api, episode, list, 3737]
 
         val nextButton = document.selectFirst(".mf-Pagination-wrap button.active + button[data-page]")
         if (nextButton != null && mangaId.isNotEmpty()) {
@@ -307,7 +270,6 @@ class Toon11 : ParsedHttpSource() {
     private fun parseChapterDate(date: String?): Long {
         if (date.isNullOrBlank()) return 0L
         return try {
-            // Format example: 2026.01.26
             val dateFormat = SimpleDateFormat("yyyy.MM.dd", Locale.KOREA)
             dateFormat.parse(date)?.time ?: 0L
         } catch (e: Exception) {
@@ -331,59 +293,6 @@ class Toon11 : ParsedHttpSource() {
     }
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
-
-    // ---------- Interceptors ----------
-    private class FixupHeadersInterceptor(
-        private val baseUrl: String,
-    ) : Interceptor {
-
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val req = chain.request()
-            val b = req.newBuilder()
-
-            // redirect / www / subdomain 섞여도 Referer가 안 꼬이게
-            val referer = "${req.url.scheme}://${req.url.host}/"
-            b.header("Referer", referer)
-
-            if (isImageRequest(req)) {
-                b.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
-            }
-            return chain.proceed(b.build())
-        }
-    }
-
-    /**
-     * delegate DNS(앱 설정: DoH/프록시 등)를 그대로 사용하면서,
-     * 결과가 IPv4/IPv6 혼합이면 IPv4를 우선 사용하도록 필터링.
-     *
-     * - IPv4가 하나라도 있으면 IPv4만 반환
-     * - IPv4가 없으면 원본 그대로 반환 (IPv6-only 환경 대비)
-     */
-    private class FilteringIPv4Dns(
-        private val delegate: Dns,
-    ) : Dns {
-        override fun lookup(hostname: String): List<InetAddress> {
-            val all = delegate.lookup(hostname)
-            val v4 = all.filterIsInstance<Inet4Address>()
-            return if (v4.isNotEmpty()) v4 else all
-        }
-    }
-
-    private companion object {
-        // RateLimit
-        private const val RATE_LIMIT_PERMITS = 1
-        private const val RATE_LIMIT_PERIOD_SECONDS = 2L
-
-        private fun isImageRequest(request: Request): Boolean {
-            val p = request.url.encodedPath.lowercase(Locale.US)
-            return p.endsWith(".webp") ||
-                p.endsWith(".png") ||
-                p.endsWith(".jpg") ||
-                p.endsWith(".jpeg") ||
-                p.endsWith(".gif") ||
-                p.endsWith(".avif")
-        }
-    }
 
     // ---------- Filters ----------
     override fun getFilterList() = FilterList(
