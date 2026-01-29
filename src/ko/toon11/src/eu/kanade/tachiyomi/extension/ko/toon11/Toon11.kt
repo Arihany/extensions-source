@@ -13,6 +13,7 @@ import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -20,6 +21,7 @@ import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
+import java.io.IOException
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.ArrayList
@@ -164,46 +166,77 @@ class Toon11 : ParsedHttpSource() {
         else -> SManga.UNKNOWN
     }
 
-    private tailrec fun parseChapters(nextURL: String, chapters: ArrayList<SChapter>) {
-        val newpage = fetchPagesFromNav(nextURL)
-        newpage.select(chapterListSelector()).forEach {
-            chapters.add(chapterFromElement(it))
+    // ==========
+    // Chapter list: NO pagination.
+    // Detail page -> "처음부터" viewer -> modal(#sList) full episode list
+    // ==========
+
+    private val jumpIdRegex = Regex("""jump\((\d+)\)""")
+
+    private fun toBbsRelative(url: HttpUrl): String {
+        val path = if (url.encodedPath.startsWith("/bbs/")) {
+            url.encodedPath.removePrefix("/bbs")
+        } else {
+            url.encodedPath
         }
-        val newURL = newpage.selectFirst(".pg_current ~ .pg_page")?.absUrl("href")
-        if (!newURL.isNullOrBlank()) parseChapters(newURL, chapters)
+        val q = url.encodedQuery
+        return if (q.isNullOrEmpty()) path else "$path?$q"
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        val nav = document.selectFirst("span.pg")
-        val chapters = ArrayList<SChapter>()
+        val detailDoc = response.asJsoup()
 
-        document.select(chapterListSelector()).forEach {
-            chapters.add(chapterFromElement(it))
+        val firstEpisodeAbs = detailDoc.selectFirst("a.btn-first-episode")
+            ?.absUrl("href")
+            ?.takeIf { it.isNotBlank() }
+            ?: throw IOException("Missing first-episode link (a.btn-first-episode)")
+
+        val viewerDoc = rateLimitedClient.newCall(GET(firstEpisodeAbs, headers))
+            .execute()
+            .use { resp ->
+                if (!resp.isSuccessful) {
+                    throw IOException("Viewer request failed: HTTP ${resp.code} url=$firstEpisodeAbs")
+                }
+                resp.asJsoup()
+            }
+
+        val buttons = viewerDoc.select("#sList ul.toonslist button[onclick]")
+        if (buttons.isEmpty()) {
+            throw IOException("Missing episode list in viewer modal (#sList ul.toonslist)")
         }
 
-        if (nav == null) {
-            return chapters
+        // Modal list is typically 1화 -> ... ascending.
+        // Tachiyomi expects latest first (descending).
+        val template = firstEpisodeAbs.toHttpUrl()
+
+        val entries = buttons.mapNotNull { btn ->
+            val onclick = btn.attr("onclick")
+            val wrId = jumpIdRegex.find(onclick)?.groupValues?.get(1) ?: return@mapNotNull null
+            val title = btn.text().trim()
+            wrId to title
         }
 
-        val pg2url = nav.selectFirst(".pg_current ~ .pg_page")!!.absUrl("href")
+        val reversed = entries.asReversed()
+        val total = reversed.size
 
-        // recursively build the chapter list
+        return reversed.mapIndexed { idx, (wrId, title) ->
+            val abs = template.newBuilder()
+                .setQueryParameter("wr_id", wrId)
+                .build()
 
-        parseChapters(pg2url, chapters)
+            val rel = toBbsRelative(abs)
 
-        return chapters
+            SChapter.create().apply {
+                setUrlWithoutDomain(rel)
+                name = title
+                // HTML 순서만 신뢰: 최신이 가장 큰 번호를 갖게 해서 정렬 안정화
+                chapter_number = (total - idx).toFloat()
+                date_upload = 0L
+            }
+        }
     }
 
-    private fun fetchPagesFromNav(url: String) =
-        rateLimitedClient.newCall(GET(url, headers)).execute().asJsoup()
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
-        return rateLimitedClient.newCall(pageListRequest(chapter))
-            .asObservableSuccess()
-            .map { response -> pageListParse(response.asJsoup()) }
-    }
-
+    // These are kept for compatibility with ParsedHttpSource, but chapterListParse() bypasses them.
     override fun chapterListSelector() = "#comic-episode-list > li"
 
     override fun chapterFromElement(element: Element): SChapter {
@@ -228,6 +261,12 @@ class Toon11 : ParsedHttpSource() {
             null
         }
         return date?.time ?: 0L
+    }
+
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        return rateLimitedClient.newCall(pageListRequest(chapter))
+            .asObservableSuccess()
+            .map { response -> pageListParse(response.asJsoup()) }
     }
 
     override fun pageListRequest(chapter: SChapter): Request {
@@ -265,7 +304,8 @@ class Toon11 : ParsedHttpSource() {
 
     class SelectFilterOption(val name: String, val value: String)
 
-    abstract class SelectFilter(name: String, private val options: List<SelectFilterOption>, default: Int = 0) : Filter.Select<String>(name, options.map { it.name }.toTypedArray(), default) {
+    abstract class SelectFilter(name: String, private val options: List<SelectFilterOption>, default: Int = 0) :
+        Filter.Select<String>(name, options.map { it.name }.toTypedArray(), default) {
         val selected: String
             get() = options[state].value
     }
@@ -316,6 +356,7 @@ class Toon11 : ParsedHttpSource() {
         SelectFilterOption("하렘", "하렘"),
         SelectFilterOption("요리", "요리"),
     )
+
     private companion object {
         private const val RATE_LIMIT_REQUESTS = 2
         private const val RATE_LIMIT_PERIOD_SECONDS = 1L
