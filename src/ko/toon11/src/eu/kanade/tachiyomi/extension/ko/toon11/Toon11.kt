@@ -29,10 +29,7 @@ import java.util.Locale
 class Toon11 : ParsedHttpSource() {
 
     override val name = "cookmana"
-
-    // www 제거: Referer/리다이렉트 꼬임 방지용
-    override val baseUrl = "https://cookmana.com"
-
+    override val baseUrl = "https://www.cookmana.com"
     override val lang = "ko"
     override val supportsLatest = true
 
@@ -338,8 +335,11 @@ class Toon11 : ParsedHttpSource() {
             val req = chain.request()
             val b = req.newBuilder()
 
+            // redirect / www / subdomain 섞여도 Referer가 안 꼬이게
+            val referer = "${req.url.scheme}://${req.url.host}/"
+            b.header("Referer", referer)
+
             if (isImageRequest(req)) {
-                b.header("Referer", "$baseUrl/")
                 b.header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
             }
             return chain.proceed(b.build())
