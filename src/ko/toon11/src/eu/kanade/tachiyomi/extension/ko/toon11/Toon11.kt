@@ -218,7 +218,7 @@ class Toon11 : ParsedHttpSource() {
             .addQueryParameter("page", "1")
             .addQueryParameter("order", "desc")
             .build()
-        
+            
         return GET(apiUrl, headers)
     }
 
@@ -228,7 +228,7 @@ class Toon11 : ParsedHttpSource() {
         // API returns HTML fragment (list items), wrap it to make a valid document
         val htmlFragment = nextResponse.body.string()
         val document = org.jsoup.Jsoup.parseBodyFragment(htmlFragment)
-        
+
         document.select(chapterListSelector()).forEach {
             chapters.add(chapterFromElement(it))
         }
@@ -313,27 +313,16 @@ class Toon11 : ParsedHttpSource() {
 
     // ---------- Pages ----------
     override fun pageListRequest(chapter: SChapter): Request {
-        val u0 = chapter.url.trim()
-        val u = if (u0.startsWith("/")) u0 else "/$u0"
-        val path = if (u.startsWith("/bbs/")) u else "/bbs$u"
-        return GET(baseUrl + path, headers)
+        return GET(baseUrl + chapter.url, headers)
     }
 
     override fun pageListParse(document: Document): List<Page> {
-        val rawImageLinks = document.selectFirst("script + script[type^=text/javascript]:not([src])")!!.data()
-        val imgList = extractList(rawImageLinks)
+        return document.select(".lazy-img-wrap img").mapIndexed { i, element ->
+            val url = element.attr("src").takeIf { it.isNotBlank() }
+                ?: element.attr("data-src-r")
 
-        return imgList.mapIndexed { i, img ->
-            Page(i, imageUrl = "https:$img")
+            Page(i, imageUrl = normalizeImgUrl(url ?: "")!!)
         }
-    }
-
-    private val imgListRegex = """img_list\s*=\s*(\[.*?])""".toRegex(RegexOption.DOT_MATCHES_ALL)
-
-    private fun extractList(jsString: String): List<String> {
-        val matchResult = imgListRegex.find(jsString)
-        val listString = matchResult?.groupValues?.get(1) ?: return emptyList()
-        return Json.decodeFromString(listString)
     }
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
