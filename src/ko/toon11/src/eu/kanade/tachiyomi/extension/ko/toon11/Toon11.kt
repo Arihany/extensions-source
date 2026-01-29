@@ -318,6 +318,6 @@ class Toon11 : ParsedHttpSource() {
     )
     private companion object {
         private const val RATE_LIMIT_REQUESTS = 1
-        private const val RATE_LIMIT_PERIOD_SECONDS = 2L
+        private const val RATE_LIMIT_PERIOD_SECONDS = 3L
     }
 }
