@@ -1,9 +1,11 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
@@ -20,6 +22,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import rx.Observable
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.ArrayList
@@ -50,11 +53,20 @@ class Toon11 : ParsedHttpSource() {
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         )
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+    /**
+     * ✅ 이미지 다운로드용(무제한) = Tachiyomi가 이미지 요청에 사용하는 기본 client
+     * ✅ HTML 요청용(rate limit) = 아래 fetch*에서만 사용
+     */
+    private val baseClient: OkHttpClient = network.cloudflareClient.newBuilder()
         .dispatcher(limiterDispatcher)
-        .apply { rateLimit(RATE_LIMIT_PERMITS, RATE_LIMIT_PERIOD_SECONDS) }
         .addInterceptor(FixupHeadersInterceptor(baseUrl))
         .build()
+
+    private val rateLimitedClient: OkHttpClient = baseClient.newBuilder()
+        .apply { rateLimit(RATE_LIMIT_PERMITS, RATE_LIMIT_PERIOD_SECONDS) }
+        .build()
+
+    override val client: OkHttpClient = baseClient
 
     // ---------- Requests ----------
     private val latestBase =
@@ -105,6 +117,45 @@ class Toon11 : ParsedHttpSource() {
 
             GET(url, headers)
         }
+    }
+
+    // ---------- HTML fetch는 전부 rateLimitedClient로 ----------
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        return rateLimitedClient.newCall(popularMangaRequest(page))
+            .asObservableSuccess()
+            .map(::popularMangaParse)
+    }
+
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
+        return rateLimitedClient.newCall(latestUpdatesRequest(page))
+            .asObservableSuccess()
+            .map(::latestUpdatesParse)
+    }
+
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        return rateLimitedClient.newCall(searchMangaRequest(page, query, filters))
+            .asObservableSuccess()
+            .map(::searchMangaParse)
+    }
+
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
+        return rateLimitedClient.newCall(mangaDetailsRequest(manga))
+            .asObservableSuccess()
+            .map { response ->
+                mangaDetailsParse(response.asJsoup()).apply { initialized = true }
+            }
+    }
+
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> {
+        return rateLimitedClient.newCall(chapterListRequest(manga))
+            .asObservableSuccess()
+            .map(::chapterListParse)
+    }
+
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        return rateLimitedClient.newCall(pageListRequest(chapter))
+            .asObservableSuccess()
+            .map { response -> pageListParse(response.asJsoup()) }
     }
 
     // ---------- Selectors ----------
@@ -227,8 +278,9 @@ class Toon11 : ParsedHttpSource() {
         return chapters
     }
 
+    // ✅ HTML 네비게이션 페이지도 rateLimitedClient로
     private fun fetchPagesFromNav(url: String) =
-        client.newCall(GET(url, headers)).execute().asJsoup()
+        rateLimitedClient.newCall(GET(url, headers)).execute().asJsoup()
 
     override fun chapterListSelector() = "#comic-episode-list > li"
 
@@ -240,13 +292,6 @@ class Toon11 : ParsedHttpSource() {
         return m.groupValues.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
     }
 
-    /**
-     * 챕터 URL은 DB 키로 쓰이니까 "항상 같은 형태"로 통일해야 함.
-     * - 절대 URL -> path+query로 변환
-     * - ./ 제거
-     * - /bbs/ 프리픽스 제거 (pageListRequest에서 /bbs를 붙이므로)
-     * - 선행 '/' 강제
-     */
     private fun canonicalizeChapterUrl(raw: String): String? {
         var u = raw.trim()
         if (u.isEmpty()) return null
@@ -279,7 +324,6 @@ class Toon11 : ParsedHttpSource() {
         val canon = canonicalizeChapterUrl(href).orEmpty()
 
         return SChapter.create().apply {
-            // 여기서 url이 흔들리면 "봤던 회차가 새 회차로 재등장"한다. 그러니 정규화 강제.
             setUrlWithoutDomain(canon)
             name = urlEl.selectFirst(".episode-title")!!.text()
             dateEl?.also { date_upload = dateParse(it.text()) }
@@ -299,7 +343,6 @@ class Toon11 : ParsedHttpSource() {
 
     // ---------- Pages ----------
     override fun pageListRequest(chapter: SChapter): Request {
-        // 과거 DB에 "/bbs/..." 로 저장된 챕터가 남아있을 수 있어서 중복 방지
         val u0 = chapter.url.trim()
         val u = if (u0.startsWith("/")) u0 else "/$u0"
         val path = if (u.startsWith("/bbs/")) u else "/bbs$u"
@@ -344,8 +387,7 @@ class Toon11 : ParsedHttpSource() {
     }
 
     private companion object {
-        // NewToki 스타일 그대로: rateLimit(permits, periodSeconds)
-        // 값은 서버 상태 보면서 니가 알아서 바꿔. (보통 period는 "초"로 쓰는 패턴)
+        // NewToki 스타일 rateLimit(permits, periodSeconds) 하드코딩
         private const val RATE_LIMIT_PERMITS = 1
         private const val RATE_LIMIT_PERIOD_SECONDS = 2L
 
