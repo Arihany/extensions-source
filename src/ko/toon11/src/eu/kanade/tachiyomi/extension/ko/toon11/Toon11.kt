@@ -193,7 +193,7 @@ class Toon11 : ParsedHttpSource() {
         return SManga.create().apply {
             val infoSection = document.selectFirst(".dt-left-tt")
             title = infoSection?.selectFirst("h1")?.text() ?: "Unknown"
-            
+
             // Thumbnail from style="background-image: url('...')"
             val bgImg = document.selectFirst(".dt-mn-bgimg")?.attr("style")
             val bgUrl = bgImg?.substringAfter("url('")?.substringBefore("')")
