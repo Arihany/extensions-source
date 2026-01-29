@@ -1,8 +1,11 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.asObservableSuccess
+import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
@@ -16,6 +19,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import rx.Observable
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.ArrayList
@@ -34,6 +38,14 @@ class Toon11 : ParsedHttpSource() {
 
     override val client: OkHttpClient = network.cloudflareClient
 
+    // Hard-coded rate limit for HTML/document requests only.
+    // Images are not rate-limited (they use `client` via Tachiyomi's image pipeline).
+    private val rateLimitedClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .rateLimit(RATE_LIMIT_REQUESTS, RATE_LIMIT_PERIOD_SECONDS)
+            .build()
+    }
+
     override fun popularMangaSelector() = "li[data-id]"
 
     override fun latestUpdatesSelector() = popularMangaSelector()
@@ -41,6 +53,38 @@ class Toon11 : ParsedHttpSource() {
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
 
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&sord=&type=upd&page=$page", headers)
+
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        return rateLimitedClient.newCall(popularMangaRequest(page))
+            .asObservableSuccess()
+            .map(::popularMangaParse)
+    }
+
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
+        return rateLimitedClient.newCall(latestUpdatesRequest(page))
+            .asObservableSuccess()
+            .map(::latestUpdatesParse)
+    }
+
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        return rateLimitedClient.newCall(searchMangaRequest(page, query, filters))
+            .asObservableSuccess()
+            .map(::searchMangaParse)
+    }
+
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
+        return rateLimitedClient.newCall(mangaDetailsRequest(manga))
+            .asObservableSuccess()
+            .map { response ->
+                mangaDetailsParse(response.asJsoup()).apply { initialized = true }
+            }
+    }
+
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> {
+        return rateLimitedClient.newCall(chapterListRequest(manga))
+            .asObservableSuccess()
+            .map(::chapterListParse)
+    }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         return if (query.isNotBlank()) {
@@ -151,7 +195,14 @@ class Toon11 : ParsedHttpSource() {
         return chapters
     }
 
-    private fun fetchPagesFromNav(url: String) = client.newCall(GET(url, headers)).execute().asJsoup()
+    private fun fetchPagesFromNav(url: String) =
+        rateLimitedClient.newCall(GET(url, headers)).execute().asJsoup()
+
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        return rateLimitedClient.newCall(pageListRequest(chapter))
+            .asObservableSuccess()
+            .map { response -> pageListParse(response.asJsoup()) }
+    }
 
     override fun chapterListSelector() = "#comic-episode-list > li"
 
@@ -265,4 +316,8 @@ class Toon11 : ParsedHttpSource() {
         SelectFilterOption("하렘", "하렘"),
         SelectFilterOption("요리", "요리"),
     )
+    private companion object {
+        private const val RATE_LIMIT_REQUESTS = 1
+        private const val RATE_LIMIT_PERIOD_SECONDS = 2L
+    }
 }
