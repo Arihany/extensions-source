@@ -11,6 +11,8 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.FormBody
@@ -19,7 +21,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
@@ -48,6 +49,8 @@ class Toon11 : ParsedHttpSource() {
             .rateLimit(RATE_LIMIT_REQUESTS, RATE_LIMIT_PERIOD_SECONDS)
             .build()
     }
+
+    private val json = Json { ignoreUnknownKeys = true }
 
     override fun popularMangaSelector() = "li[data-id]"
 
@@ -172,10 +175,14 @@ class Toon11 : ParsedHttpSource() {
 
     // ==========
     // Chapter list: NO pagination.
-    // Detail page -> "처음부터" viewer -> ajax.GetToonsList.php -> full episode list
+    // Detail page -> "처음부터" viewer -> POST ajax.GetToonsList.php (JSON)
     // ==========
 
-    private val jumpIdRegex = Regex("""jump\((\d+)\)""")
+    @Serializable
+    private data class ToonsListItem(
+        @SerialName("newsub") val newSub: String,
+        @SerialName("wr_id") val wrId: String,
+    )
 
     private fun toBbsRelative(url: HttpUrl): String {
         val path = if (url.encodedPath.startsWith("/bbs/")) {
@@ -187,36 +194,36 @@ class Toon11 : ParsedHttpSource() {
         return if (q.isNullOrEmpty()) path else "$path?$q"
     }
 
-    private fun fetchToonsListAjax(viewerAbsUrl: String): Document {
-        val viewer = viewerAbsUrl.toHttpUrl()
+    private fun fetchToonsListAjax(isId: String, stx: String, referer: String): List<ToonsListItem> {
         val ajaxUrl = "$baseUrl/bbs/ajax.GetToonsList.php".toHttpUrl()
 
-        fun buildFormBody(): FormBody {
-            val b = FormBody.Builder()
-            for (i in 0 until viewer.querySize) {
-                b.add(viewer.queryParameterName(i), viewer.queryParameterValue(i) ?: "")
-            }
-            return b.build()
-        }
-
-        fun parseAjaxResponse(resp: Response): Document {
-            val body = resp.body?.string().orEmpty()
-            if (body.isBlank()) throw IOException("Empty ajax.GetToonsList.php response")
-            return Jsoup.parse(body, resp.request.url.toString())
-        }
-
-        val req = Request.Builder()
-            .url(ajaxUrl)
-            .post(buildFormBody())
-            .headers(headers.newBuilder().set("Referer", viewerAbsUrl).build())
+        val formBody = FormBody.Builder()
+            .add("is", isId)
+            .add("stx", stx)
             .build()
 
-        return rateLimitedClient.newCall(req).execute().use { resp ->
+        val reqHeaders = headers.newBuilder()
+            .set("Origin", baseUrl)
+            .set("Referer", referer)
+            .set("X-Requested-With", "XMLHttpRequest")
+            .build()
+
+        val request = Request.Builder()
+            .url(ajaxUrl)
+            .post(formBody)
+            .headers(reqHeaders)
+            .build()
+
+        val bodyString = rateLimitedClient.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) {
                 throw IOException("ToonsListAjax failed: HTTP ${resp.code} url=${resp.request.url}")
             }
-            parseAjaxResponse(resp)
+            resp.body?.string().orEmpty()
         }
+
+        if (bodyString.isBlank()) throw IOException("Empty ajax.GetToonsList.php response")
+
+        return json.decodeFromString(bodyString)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -227,7 +234,13 @@ class Toon11 : ParsedHttpSource() {
             ?.takeIf { it.isNotBlank() }
             ?: throw IOException("Missing first-episode link (a.btn-first-episode)")
 
-        // Load viewer once (matches browser flow: page load -> ajax)
+        val viewerUrl = firstEpisodeAbs.toHttpUrl()
+        val isId = viewerUrl.queryParameter("is")?.takeIf { it.isNotBlank() }
+            ?: throw IOException("Missing 'is' query param in viewer url: $firstEpisodeAbs")
+        val stx = viewerUrl.queryParameter("stx")?.takeIf { it.isNotBlank() }
+            ?: throw IOException("Missing 'stx' query param in viewer url: $firstEpisodeAbs")
+
+        // 브라우저 흐름 맞추기: 뷰어 1회 로드 (쿠키/세션)
         rateLimitedClient.newCall(GET(firstEpisodeAbs, headers))
             .execute()
             .use { resp ->
@@ -236,35 +249,32 @@ class Toon11 : ParsedHttpSource() {
                 }
             }
 
-        val ajaxDoc = fetchToonsListAjax(firstEpisodeAbs)
-        val buttons = ajaxDoc.select("ul.toonslist button[onclick*=jump]")
-        if (buttons.isEmpty()) {
-            throw IOException("Missing episode list from ajax.GetToonsList.php (no ul.toonslist button[onclick*=jump])")
-        }
+        // AJAX(JSON)로 회차 리스트 획득
+        val items = fetchToonsListAjax(isId, stx, firstEpisodeAbs)
+        if (items.isEmpty()) throw IOException("Empty episode list from ajax.GetToonsList.php")
 
-        val entries = buttons.mapNotNull { btn ->
-            val wrId = jumpIdRegex.find(btn.attr("onclick"))?.groupValues?.get(1) ?: return@mapNotNull null
-            val title = btn.text().trim() // "1화", "특별외전" 등 그대로
-            wrId to title
-        }
-
-        // HTML order is oldest -> newest. Reverse to newest -> oldest.
-        val reversed = entries.asReversed()
+        // 응답은 oldest -> newest. 역전해서 newest -> oldest (latest first)
+        val reversed = items.asReversed()
         val total = reversed.size
-        val template = firstEpisodeAbs.toHttpUrl()
 
-        return reversed.mapIndexed { idx, (wrId, title) ->
-            val abs = template.newBuilder()
-                .setQueryParameter("wr_id", wrId)
-                .build()
+        val chapterBase = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegment("bbs")
+            .addPathSegment("board.php")
+
+        return reversed.mapIndexed { idx, item ->
+            val abs = chapterBase.build().newBuilder().apply {
+                addQueryParameter("bo_table", "toons")
+                addQueryParameter("wr_id", item.wrId)
+                addQueryParameter("stx", stx)
+                addQueryParameter("is", isId)
+            }.build()
 
             val rel = toBbsRelative(abs)
 
             SChapter.create().apply {
                 setUrlWithoutDomain(rel)
-                name = title
-                // Title may not contain digits (e.g., 특별외전). Use stable order-based numbering.
-                chapter_number = (total - idx).toFloat()
+                name = item.newSub.trim()
+                chapter_number = (total - idx).toFloat() // 순서 기반 안정화 (특별외전 같은 것도 OK)
                 date_upload = 0L
             }
         }
@@ -321,7 +331,7 @@ class Toon11 : ParsedHttpSource() {
     private fun extractList(jsString: String): List<String> {
         val matchResult = imgListRegex.find(jsString)
         val listString = matchResult?.groupValues?.get(1) ?: return emptyList()
-        return Json.decodeFromString<List<String>>(listString)
+        return json.decodeFromString(listString)
     }
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
