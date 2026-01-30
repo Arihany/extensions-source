@@ -274,7 +274,7 @@ class Toon11 : ParsedHttpSource() {
             SChapter.create().apply {
                 setUrlWithoutDomain(rel)
                 name = item.newSub.trim()
-                chapter_number = (total - idx).toFloat() // 순서 기반 안정화 (특별외전 같은 것도 OK)
+                // chapter_number = (total - idx).toFloat()
                 date_upload = 0L
             }
         }
